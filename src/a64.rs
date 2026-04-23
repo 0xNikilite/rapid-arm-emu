@@ -1,14 +1,90 @@
 use std::ptr::NonNull;
+use crate::{exclusive_monitor, vaddr};
 use crate::exclusive_monitor::ExclusiveMonitor;
 use crate::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
-
 
 pub type VAddr = u64;
 
 pub const PAGE_SIZE: VAddr = 4096;
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "this ethod ensures no truncation happens"
+)]
+const fn u64_to_usize(int: u64) -> Option<usize> {
+    // FIXME feature(const_convert)
+    
+    match usize::BITS >= u64::BITS {
+        true => Some(int as usize),
+        false => {
+            // widening cast
+            let max = usize::MAX as u64;
+            if int > max {
+                return None
+            }
+            Some(PAGE_SIZE as usize)
+        },
+    }
+}
+
+
+unsafe impl vaddr::sealed::VAddr for u64 {
+    const NULL: Self = 0;
+    const PAGE_SIZE: usize = u64_to_usize(PAGE_SIZE).unwrap();
+
+    fn reservation_index(self) -> usize {
+        let mut x = self;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^= x >> 31;
+        
+        let bucket_count: u16 = exclusive_monitor::BUCKET_COUNT;
+        
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "bucket count is u16, so x mod u16 fitsi in u16"
+        )]
+        let index = (x % u64::from(bucket_count)) as u16;
+        
+        usize::from(index)
+    }
+
+    fn add_addr(self, other: Self) -> Option<Self> {
+        self.checked_add(other)
+    }
+
+    fn add_offset(self, other: usize) -> Option<Self> {
+        self.checked_add(u64::try_from(other).ok()?)
+    }
+
+    fn is_page_aligned(self) -> bool {
+        self.is_multiple_of(PAGE_SIZE)
+    }
+
+    fn try_to_usize(self) -> Option<usize> {
+        u64_to_usize(self)
+    }
+
+    fn div_rem_page_size(self) -> (Self, usize) {
+        let div = self / PAGE_SIZE;
+        // PAGE_SIZE fits in a usize, so x mod PAGE_SIZE must fit in usize
+        let offset = (self % PAGE_SIZE) as usize;
+        (div, offset)
+    }
+
+    unsafe fn div_page_size_unchecked(self) -> Self {
+        let (div, rem) = self.div_rem_page_size();
+        unsafe { core::hint::assert_unchecked(rem == 0) }
+        div
+    }
+}
+
 #[repr(C, align(16))]
 struct Vector(u128);
+
+const _: () = assert!(align_of::<Vector>() == 16);
 
 struct ExecutingData {
     sp: u64,
@@ -18,7 +94,7 @@ struct ExecutingData {
     fpsr: u32,
     fpcr: u32,
     vectors: [Vector; 32],
-
+    
 }
 
 impl ExecutingData {
@@ -28,8 +104,6 @@ impl ExecutingData {
 }
 
 pub struct Arm64CpuCore {
-    base_ptr: NonNull<u8>,
-    memory_size: u64,
     exclusive_monitor: NonNull<ExclusiveMonitor<VAddr>>,
     halt_reason: AtomicHaltReason,
     executing: parking_lot::Mutex<ExecutingData>,
@@ -66,7 +140,7 @@ impl Arm64CpuCore {
     }
 
     #[track_caller]
-    fn execute<T>(
+    fn execute(
         &self,
         fun: impl FnMut(&mut ExecutingData) -> HaltReasonInner
     ) -> HaltReason {

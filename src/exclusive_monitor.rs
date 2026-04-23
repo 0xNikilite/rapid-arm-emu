@@ -2,7 +2,7 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use crossbeam_utils::CachePadded;
 use crate::sync::Mutex;
-
+use crate::vaddr::VAddr;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub(crate) struct Version(u64);
@@ -13,41 +13,13 @@ pub(crate) struct ReservationSlot<VAddr> {
     version: Version,
 }
 
-const BUCKET_COUNT: u16 = 257;
+pub(crate) const BUCKET_COUNT: u16 = 257;
 
 
 #[repr(C)]
 pub struct ExclusiveMonitor<VAddr> {
     reservations: [CachePadded<Mutex<ReservationSlot<VAddr>>>; BUCKET_COUNT as usize],
 }
-
-mod sealed {
-    use crate::exclusive_monitor::BUCKET_COUNT;
-
-    pub trait VAddr: Copy + Eq + Sized {
-        const NULL: Self;
-
-        fn reservation_index(self) -> usize;
-    }
-
-    impl VAddr for u64 {
-        const NULL: Self = 0;
-
-        fn reservation_index(self) -> usize {
-            let mut x = self;
-            x ^= x >> 30;
-            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            x ^= x >> 27;
-            x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-            x ^= x >> 31;
-            (x % u64::from(BUCKET_COUNT)) as usize
-        }
-    }
-}
-
-pub trait VAddr: sealed::VAddr {}
-
-impl<A: sealed::VAddr> VAddr for A {}
 
 impl<A: VAddr> ExclusiveMonitor<A> {
     pub fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
@@ -67,7 +39,7 @@ impl<A: VAddr> ExclusiveMonitor<A> {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new_on_stack() -> Self {
         let mut uninit = MaybeUninit::uninit();
         Self::init(&mut uninit);
         unsafe { uninit.assume_init() }

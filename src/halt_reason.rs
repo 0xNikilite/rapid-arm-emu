@@ -25,22 +25,22 @@ bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(transparent)]
     pub struct HaltReason: u32 {
-        const MemoryFault = 0x00000004;
-        const UserDefined1 = 0x01000000;
-        const UserDefined2 = 0x02000000;
-        const UserDefined3 = 0x04000000;
-        const UserDefined4 = 0x08000000;
-        const UserDefined5 = 0x10000000;
-        const UserDefined6 = 0x20000000;
-        const UserDefined7 = 0x40000000;
-        const UserDefined8 = 0x80000000;
+        const MemoryFault  = HaltReasonInner::MemoryFault.bits();
+        const UserDefined1 = HaltReasonInner::UserDefined1.bits();
+        const UserDefined2 = HaltReasonInner::UserDefined2.bits();
+        const UserDefined3 = HaltReasonInner::UserDefined3.bits();
+        const UserDefined4 = HaltReasonInner::UserDefined4.bits();
+        const UserDefined5 = HaltReasonInner::UserDefined5.bits();
+        const UserDefined6 = HaltReasonInner::UserDefined6.bits();
+        const UserDefined7 = HaltReasonInner::UserDefined7.bits();
+        const UserDefined8 = HaltReasonInner::UserDefined8.bits();
     }
 }
 
 impl HaltReason {
     pub(crate) fn into_inner(self) -> HaltReasonInner {
-        // HaltReason is a superset of HaltReason
-        HaltReasonInner::from_bits_retain(self.bits())
+        // Self is a superset of HaltReasonInner
+        HaltReasonInner::from_bits_retain((self & Self::all()).bits())
     }
 
     pub(crate) fn from_inner(reason: HaltReasonInner) -> HaltReason {
