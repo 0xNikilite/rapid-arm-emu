@@ -15,9 +15,7 @@ pub(crate) struct ReservationSlot<VAddr> {
 
 pub(crate) const BUCKET_COUNT: u16 = 257;
 
-
-#[repr(C)]
-pub struct ExclusiveMonitor<VAddr> {
+pub(crate) struct ExclusiveMonitor<VAddr> {
     reservations: [CachePadded<Mutex<ReservationSlot<VAddr>>>; BUCKET_COUNT as usize],
 }
 
@@ -37,18 +35,6 @@ impl<A: VAddr> ExclusiveMonitor<A> {
 
             this.assume_init_mut()
         }
-    }
-
-    pub fn new_on_stack() -> Self {
-        let mut uninit = MaybeUninit::uninit();
-        Self::init(&mut uninit);
-        unsafe { uninit.assume_init() }
-    }
-
-    pub fn new_boxed() -> Box<Self> {
-        let mut uninit = Box::new_uninit();
-        Self::init(&mut uninit);
-        unsafe { uninit.assume_init() }
     }
 
     pub fn new_arc() -> Arc<Self> {
@@ -94,6 +80,47 @@ impl<A: VAddr> ExclusiveMonitor<A> {
         Ok(store_op())
     }
 }
+
+#[repr(transparent)]
+pub struct CpuFabric<VAddr>(Arc<ExclusiveMonitor<VAddr>>);
+
+impl<A: VAddr> CpuFabric<A> {
+    pub fn new() -> Self {
+        Self(ExclusiveMonitor::new_arc())
+    }
+}
+
+impl<A> Clone for CpuFabric<A> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        if !Arc::ptr_eq(&self.0, &source.0) {
+            *self = source.clone();
+        }
+    }
+}
+
+impl<A: VAddr> Default for CpuFabric<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const _: () = {
+    fn assert_sync<A: VAddr>() {
+        fn is_sync<T: Sync>() {}
+
+        is_sync::<CpuFabric<A>>()
+    }
+
+    fn assert_send<A: VAddr>() {
+        fn is_send<T: Send>() {}
+
+        is_send::<CpuFabric<A>>()
+    }
+};
 
 
 #[cfg(test)]
@@ -144,6 +171,10 @@ mod tests {
 
     #[test]
     fn test_exclusive_monitor() {
+        if cfg!(miri) {
+            return;
+        }
+
         loom::model(move || {
             let monitor = Arc::from_std(ExclusiveMonitor::<u64>::new_arc());
             let memory = Arc::new(Mutex::new(0_u32));

@@ -9,6 +9,7 @@ parking_lot = "0.12.5"
 bitflags = "2.11.1"
 crossbeam-utils = "0.8.21"
 pastey = "0.2.2"
+thiserror = "2.0.18"
 
 [dev-dependencies]
 loom = "0.7"

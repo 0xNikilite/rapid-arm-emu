@@ -1,19 +1,18 @@
-use std::ptr::NonNull;
-use crate::{exclusive_monitor, vaddr};
-use crate::exclusive_monitor::ExclusiveMonitor;
+use crate::{cpu_fabric, vaddr};
+use crate::cpu_fabric::CpuFabric;
 use crate::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
+use crate::mmu::{MemoryFault, MMU};
 
 pub type VAddr = u64;
 
 pub const PAGE_SIZE: VAddr = 4096;
 
+// FIXME feature(const_convert)
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "this ethod ensures no truncation happens"
+    reason = "this function ensures no truncation happens"
 )]
 const fn u64_to_usize(int: u64) -> Option<usize> {
-    // FIXME feature(const_convert)
-    
     match usize::BITS >= u64::BITS {
         true => Some(int as usize),
         false => {
@@ -31,6 +30,9 @@ const fn u64_to_usize(int: u64) -> Option<usize> {
 unsafe impl vaddr::sealed::VAddr for u64 {
     const NULL: Self = 0;
     const PAGE_SIZE: usize = u64_to_usize(PAGE_SIZE).unwrap();
+    const PAGE_SIZE_SELF: Self = PAGE_SIZE;
+    
+    type InsnWord = u32;
 
     fn reservation_index(self) -> usize {
         let mut x = self;
@@ -40,7 +42,7 @@ unsafe impl vaddr::sealed::VAddr for u64 {
         x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
         x ^= x >> 31;
         
-        let bucket_count: u16 = exclusive_monitor::BUCKET_COUNT;
+        let bucket_count: u16 = cpu_fabric::BUCKET_COUNT;
         
         #[allow(
             clippy::cast_possible_truncation,
@@ -59,8 +61,8 @@ unsafe impl vaddr::sealed::VAddr for u64 {
         self.checked_add(u64::try_from(other).ok()?)
     }
 
-    fn is_page_aligned(self) -> bool {
-        self.is_multiple_of(PAGE_SIZE)
+    fn is_multiple_of(self, rhs: Self) -> bool {
+        self.is_multiple_of(rhs)
     }
 
     fn try_to_usize(self) -> Option<usize> {
@@ -79,8 +81,15 @@ unsafe impl vaddr::sealed::VAddr for u64 {
         unsafe { core::hint::assert_unchecked(rem == 0) }
         div
     }
+    
+    fn fetch_insn_word(self, mmu: &MMU<Self>) -> Result<Self::InsnWord, MemoryFault> {
+        let (page, offset) = mmu.aligned_static_acces::<4>(self)?;
+        // Safety: `self` is properly aligned since `aligned_static_acces` succeded
+        unsafe { page.fetch32(offset) }
+    }
 }
 
+#[derive(Copy, Clone)]
 #[repr(C, align(16))]
 struct Vector(u128);
 
@@ -94,7 +103,6 @@ struct ExecutingData {
     fpsr: u32,
     fpcr: u32,
     vectors: [Vector; 32],
-    
 }
 
 impl ExecutingData {
@@ -104,39 +112,38 @@ impl ExecutingData {
 }
 
 pub struct Arm64CpuCore {
-    exclusive_monitor: NonNull<ExclusiveMonitor<VAddr>>,
+    mmu: MMU<VAddr>,
+    fabric: CpuFabric<VAddr>,
     halt_reason: AtomicHaltReason,
     executing: parking_lot::Mutex<ExecutingData>,
 }
 
 impl Arm64CpuCore {
-    // FIXME broken docs
-    /// Creates a new CPU core backed by guest memory at `base_ptr`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must guarantee all of the following:
-    ///
-    /// - `base_ptr` points to a valid allocation of at least `memory_size` bytes.
-    /// - `memory_size` must be a multiple of `PAGE_SIZE`
-    /// - That allocation remains alive and must not be freed for at least as long as
-    ///   this `Arm64CpuCore` exists.
-    /// - Any access through `base_ptr`, whether by this CPU core or by external code,
-    ///   must obey Rust's aliasing and synchronization rules.
-    /// - If other code reads or writes the pointed-to memory while this CPU may execute,
-    ///   the caller must ensure the CPU is not concurrently executing instructions that
-    ///   may access that memory.
-    ///
-    /// In other words, the backing memory must outlive the CPU core, and the caller is
-    /// responsible for preventing concurrent unsynchronized access between the CPU and
-    /// any external user of that memory.
-    pub unsafe fn new(
-        base_ptr: *mut u8,
-        memory_size: VAddr,
-        exclusive_monitor: *const ExclusiveMonitor<VAddr>,
-    ) -> Self {
-        let _ = (base_ptr, memory_size, exclusive_monitor);
-        todo!()
+    pub fn new(mmu: MMU<VAddr>, fabric: CpuFabric<VAddr>) -> Self {
+        Self {
+            mmu,
+            fabric,
+            halt_reason: AtomicHaltReason::new(HaltReasonInner::empty()),
+            executing: parking_lot::Mutex::new(const {
+                ExecutingData {
+                    sp: 0,
+                    pc: 0,
+                    x_registers: [0; 31],
+                    pstate: 0,
+                    fpsr: 0,
+                    fpcr: 0,
+                    vectors: [Vector(0); 32],
+                }
+            })
+        }
+    }
+
+    pub fn mmu(&self) -> &MMU<VAddr> {
+        &self.mmu
+    }
+
+    pub fn mmu_mut(&mut self) -> &mut MMU<VAddr> {
+        &mut self.mmu
     }
 
     #[track_caller]

@@ -13,10 +13,10 @@
 )]
 
 mod ir;
-mod mmu;
+pub(crate) mod sync;
+pub mod cpu_fabric;
 
+pub mod mmu;
 pub mod vaddr;
 pub mod halt_reason;
-pub mod exclusive_monitor;
-pub mod sync;
 pub mod a64;
