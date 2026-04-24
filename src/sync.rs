@@ -1,4 +1,3 @@
-
 cfg_select! {
     test => {
         use loom::sync::Mutex as LoomMutex;

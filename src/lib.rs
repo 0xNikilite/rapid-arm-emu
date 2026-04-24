@@ -8,6 +8,7 @@
     clippy::cast_possible_wrap,
     // Signed -> Unsigned
     clippy::cast_sign_loss,
+    clippy::arithmetic_side_effects,
     reason = "emulators require precise bit-level accuracy; \
               implicit casts can introduce subtle, hard-to-debug architectural discrepancies"
 )]

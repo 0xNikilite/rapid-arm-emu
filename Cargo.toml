@@ -11,5 +11,24 @@ crossbeam-utils = "0.8.21"
 pastey = "0.2.2"
 thiserror = "2.0.18"
 
+[dependencies.bytemuck]
+version = "1.25.0"
+features = [
+    "align_offset",
+    "alloc_uninit",
+    "const_zeroed",
+    "derive",
+    "impl_core_error",
+    "min_const_generics",
+    "must_cast",
+    "must_cast_extra",
+    "pod_saturating",
+    "track_caller",
+    "transparentwrapper_extra",
+    "zeroable_atomics",
+    "zeroable_maybe_uninit",
+    "zeroable_unwind_fn",
+]
+
 [dev-dependencies]
 loom = "0.7"

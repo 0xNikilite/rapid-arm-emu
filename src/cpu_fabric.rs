@@ -1,11 +1,30 @@
+//! CPU fabric state shared by emulated CPU contexts.
+//!
+//! The `cpu_fabric` module owns state that is conceptually shared between CPUs, cores.
+//! Today, that shared state is the exclusive monitor which is used to model
+//! load-exclusive/store-exclusive style atomic sequences.
+//!
+//! In the future, `CpuFabric` may grow to include other CPU-adjacent shared
+//! resources, such as interrupt routing, cache-coherency metadata, shared
+//! timing state, or other cross-core coordination structures. For now, it is a
+//! small wrapper around the exclusive monitor so cloned CPU contexts can observe
+//! and invalidate the same reservation state.
+
+
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use crossbeam_utils::CachePadded;
 use crate::sync::Mutex;
+use crate::vaddr;
 use crate::vaddr::VAddr;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub(crate) struct Version(u64);
+
+pub(crate) struct ReservationToken<A: VAddr> {
+    version: Version,
+    value: <A as vaddr::sealed::VAddr>::ExclusiveMonitorLoadValue,
+}
 
 
 pub(crate) struct ReservationSlot<VAddr> {
@@ -20,6 +39,8 @@ pub(crate) struct ExclusiveMonitor<VAddr> {
 }
 
 impl<A: VAddr> ExclusiveMonitor<A> {
+
+    /// #
     pub fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
         unsafe {
             let ptr = this.as_mut_ptr();
@@ -44,31 +65,34 @@ impl<A: VAddr> ExclusiveMonitor<A> {
     }
 
     #[must_use]
-    pub(crate) fn ldrex<T>(
+    pub(crate) fn ldrex(
         &self,
         addr: A,
-        load_op: impl FnOnce() -> T,
-    ) -> (Version, T) {
+        load_op: impl FnOnce() -> A::ExclusiveMonitorLoadValue,
+    ) -> ReservationToken<A> {
         let reserve_idx = addr.reservation_index();
         let mut lock = self.reservations[reserve_idx].lock();
 
         lock.address = addr;
-        let reserved_for = lock.version;
+        let version = lock.version;
 
-        let ret = load_op();
-        (reserved_for, ret)
+        let value = load_op();
+        ReservationToken {
+            version,
+            value,
+        }
     }
 
     pub(crate) fn strex<T>(
         &self,
         addr: A,
-        tok: Version,
-        store_op: impl FnOnce() -> T,
+        tok: ReservationToken<A>,
+        store_op: impl FnOnce(A::ExclusiveMonitorLoadValue) -> Result<T, ()>,
     ) -> Result<T, ()> {
         let reserve_idx = addr.reservation_index();
         let mut lock = self.reservations[reserve_idx].lock();
 
-        if lock.address != addr || lock.version != tok {
+        if lock.address != addr || lock.version != tok.version {
             return Err(());
         }
 
@@ -77,7 +101,7 @@ impl<A: VAddr> ExclusiveMonitor<A> {
         // and there aren't any better alternatives
         lock.version.0 = lock.version.0.wrapping_add(1);
 
-        Ok(store_op())
+        store_op(tok.value)
     }
 }
 
@@ -109,13 +133,13 @@ impl<A: VAddr> Default for CpuFabric<A> {
 }
 
 const _: () = {
-    fn assert_sync<A: VAddr>() {
+    fn _assert_sync<A: VAddr>() {
         fn is_sync<T: Sync>() {}
 
         is_sync::<CpuFabric<A>>()
     }
 
-    fn assert_send<A: VAddr>() {
+    fn _assert_send<A: VAddr>() {
         fn is_send<T: Send>() {}
 
         is_send::<CpuFabric<A>>()
@@ -128,6 +152,7 @@ mod tests {
     use super::*;
 
     use loom::sync::{Arc, Mutex, Condvar};
+    use crate::a64::sealed::ExclusiveMonitorLoad;
 
     struct BarrierState {
         count: usize,
@@ -156,7 +181,7 @@ mod tests {
         fn wait(&self) {
             let mut lock = self.state.lock().unwrap();
             let local_gen = lock.generation_id;
-            lock.count += 1;
+            lock.count = lock.count.strict_add(1);
             if lock.count < self.num_threads {
                 while local_gen == lock.generation_id {
                     lock = self.cond.wait(lock).unwrap();
@@ -187,9 +212,17 @@ mod tests {
                 loom::thread::spawn(move || {
                     let addr = 0x10000DEAD00BEEF;
 
-                    let (token, ()) = monitor.ldrex(addr, || {});
+                    let token = monitor.ldrex(addr, || ExclusiveMonitorLoad::U8(0));
                     barrier.wait();
-                    let _ = monitor.strex(addr, token, || *memory.try_lock().unwrap() += 1);
+                    let _ = monitor.strex(addr, token, |val| {
+                        match val {
+                            ExclusiveMonitorLoad::U8(0) => {
+                                *memory.try_lock().unwrap() += 1;
+                                Ok(())
+                            }
+                            _ => Err(())
+                        }
+                    });
                 })
             };
 
