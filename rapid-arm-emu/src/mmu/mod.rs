@@ -1,7 +1,7 @@
 //! Page-based virtual memory abstraction backed by host memory.
 //!
-//! This module implements a small MMU-like layer that maps guest virtual pages
-//! onto host memory and enforces per-page access permissions.
+//! This module implements a small MMU-like layer that maps Armv9 guest virtual
+//! pages onto host memory and enforces per-page access permissions.
 //!
 //! Core behavior:
 //! - Memory is mapped in page-sized chunks.
@@ -18,14 +18,11 @@
 //! - Concurrent loads and stores through the MMU are allowed.
 //! - Public safe APIs must not produce undefined behavior, even when accesses
 //!   race.
-//! - Atomicity follows the single-copy atomicity guarantees of the active ARM
-//!   CPU profile:
-//!   - on 32-bit ARM: naturally aligned 8-, 16-, and 32-bit operations are
-//!     single-copy atomic;
-//!   - on 64-bit ARM: naturally aligned 8-, 16-, 32-, and 64-bit operations are
-//!     single-copy atomic.
-//! - Operations outside the CPU's single-copy atomic width, or operations split
-//!   across pages, may be observed as multiple smaller operations.
+//! - Atomicity follows the Armv9 memory model for the active [`CpuFabric`].
+//! - Naturally aligned scalar accesses use the single-copy atomicity guarantees
+//!   provided by that fabric.
+//! - Operations outside the fabric's single-copy atomic width, or operations
+//!   split across pages, may be observed as multiple smaller operations.
 //!
 //! Safety model:
 //! - All public safe functions are required to be UB-free.
@@ -34,24 +31,83 @@
 //!   for the lifetime of the MMU mapping.
 //! - Once memory is mapped into an MMU, the backing pointer must not be accessed
 //!   directly while the mapping is alive, except for use as backing memory for an
-//!   MMU mapping under the same aliasing/concurrency rules that means, MMUs
-//!   must use the same bit width, so MMU<u64> and MMU<u32> can't share pages.
+//!   MMU mapping under the same aliasing/concurrency rules and the same
+//!   [`CpuFabric`] memory model.
 //!
 //! Typical usage:
-//! 1. Construct an [`MMU`].
-//! 2. Map one or more host memory regions with [`MMU::map_memory`].
-//! 3. Access byte ranges through [`MMU::load`] / [`MMU::store`].
+//! 1. Construct an [`IoMMU`].
+//! 2. Map one or more host memory regions with [`IoMMU::map_memory`].
+//! 3. Access byte ranges through [`IoMMU::load`] / [`IoMMU::store`].
 //! 4. Access scalars through `load_byte/load16/load32/load64` and
 //!    `store_byte/store16/store32/store64`.
 
-
+use std::collections::HashSet;
 use std::hint::cold_path;
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::num::NonZero;
+use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU8, Ordering};
-use crate::vaddr::VAddr;
+use parking_lot::Mutex;
+use crate::cpu_fabric::CpuFabric;
+
+
+mod memops;
+
+// FIXME feature(const_convert)
+macro_rules! make_checked_usize_cast {
+    ($from: ident => $to: ident) => {
+        pastey::paste! {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "this function ensures no truncation happens"
+            )]
+            #[inline(always)]
+            const fn [<$from _to_ $to>](int: $from) -> Option<$to> {
+                match $to::BITS >= $from::BITS {
+                    true => Some(int as $to),
+                    false => {
+                        // this would be a widening cast
+                        let max: $from = $to::MAX as $from;
+                        if int > max {
+                            cold_path();
+                            return None
+                        }
+                        Some(int as $to)
+                    },
+                }
+            }
+        }
+
+    };
+}
+
+make_checked_usize_cast! { u64 => usize }
+make_checked_usize_cast! { usize => u64 }
+
+#[inline(always)]
+const fn u64_add_usize(x: u64, y: usize) -> Option<u64> {
+    let Some(y) = usize_to_u64(y) else {
+        cold_path();
+        return None
+    };
+    x.checked_add(y)
+}
+
+pub const PAGE_SIZE_U64: u64 = 4096;
+pub const PAGE_SIZE: usize = u64_to_usize(PAGE_SIZE_U64).unwrap();
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bits must be less than 24 bits; which always fits in a u8"
+)]
+pub const PAGE_SHIFT: u8 = {
+    assert!(PAGE_SIZE.is_power_of_two());
+    let bits = PAGE_SIZE.ilog2();
+    assert!(bits < 24, "page size too big");
+    bits as u8
+};
+
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,7 +135,7 @@ bitflags::bitflags! {
 /// - targets an unmapped page,
 /// - violates page permissions,
 /// - overflows the virtual address range,
-/// - fails a required alignment check,
+/// - fails an address-alignment check required by a specific operation,
 /// - crosses into an unmapped or insufficiently-permitted page,
 /// - or otherwise fails MMU validation.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -104,6 +160,28 @@ macro_rules! ensure {
 }
 
 
+#[inline]
+fn div_rem_page_size(vaddr: u64) -> (u64, usize) {
+    (
+        vaddr >> PAGE_SHIFT,
+        {
+            let remainder = vaddr & const { PAGE_SIZE_U64.strict_sub(1) };
+            // Safety: PAGE_SIZE fits in usize, and we are taking the remainder by PAGE_SIZE
+            //         therefore the remainder **MUST** fit in a usize
+            unsafe { u64_to_usize(remainder).unwrap_unchecked() }
+        }
+    )
+}
+
+#[inline]
+fn div_page_size_checked(vaddr: u64) -> Result<u64, MemoryFault> {
+    let (page, offset) = div_rem_page_size(vaddr);
+    ensure!(offset == 0);
+    Ok(page)
+}
+
+
+
 impl MemoryProtections {
     // Self is a superset of PageFlags
     pub(crate) fn into_page_flags(self) -> PageFlags {
@@ -112,19 +190,65 @@ impl MemoryProtections {
 }
 
 
-// invariant: if any of the memory protection bits in page_flags is on, then ptr MUST be Some(...)
-pub(crate) struct Page<VAddr> {
+/// Per-page invariants:
+///
+/// Mapping state:
+///
+/// - `ptr == None` means the page is unmapped.
+/// - `ptr == Some(_)` means the page is mapped.
+/// - If any guest memory-protection bit is set in `page_flags`
+///   (`READ`, `WRITE`, or `EXECUTE`), then `ptr` must be `Some`.
+///
+/// Mapping identity:
+///
+/// Once a page is mapped, its backing pointer is stable for the lifetime of that
+/// mapping. A mapped page's pointer must not be replaced directly.
+///
+/// To change the backing pointer, the page must first be unmapped through
+/// [`Page::unmap`], and only then mapped again with the new pointer.
+///
+/// Valid transition:
+///
+/// ```text
+/// Some(old_ptr) -> None -> Some(new_ptr)
+/// ```
+///
+/// Invalid transition:
+///
+/// ```text
+/// Some(old_ptr) -> Some(new_ptr)
+/// ```
+///
+/// Exclusive access requirement:
+///
+/// Changing either the page's memory protections or its mapping state requires
+/// exclusive access to the [`Page`].
+///
+/// In practice, this means:
+///
+/// - changing guest permission bits (`READ`, `WRITE`, `EXECUTE`) requires
+///   `&mut Page`;
+/// - mapping a page requires creating/replacing the [`Page`] through exclusive
+///   access to the page table entry;
+/// - unmapping a page requires `&mut Page`;
+/// - replacing a mapped page's backing pointer requires first calling
+///   [`Page::unmap`] with `&mut Page`.
+///
+/// Shared access to a page may perform guest loads/stores and may update
+/// non-permission bookkeeping bits such as `INSN_DIRTY`, but it must not change
+/// the page's mapping state or guest memory protections.
+pub(crate) struct Page {
+    // Note: the page flags can for sure be stored in the lo bits of the page pointer
+    //       but this works for now, and is easier to ensure propper work
     ptr: Option<NonNull<AtomicU8>>,
     page_flags: AtomicU8,
-    _addr_ty: PhantomData<VAddr>
 }
 
-impl<A: VAddr> Page<A> {
+impl Page {
     #[allow(clippy::declare_interior_mutable_const)]
     pub(crate) const UNMAPPED: Self = Self {
         ptr: None,
         page_flags: AtomicU8::new(0),
-        _addr_ty: PhantomData,
     };
 
     pub(crate) fn mapped(
@@ -135,7 +259,6 @@ impl<A: VAddr> Page<A> {
         Self {
             ptr: Some(ptr),
             page_flags: AtomicU8::new(page_flags),
-            _addr_ty: PhantomData,
         }
     }
 
@@ -147,10 +270,27 @@ impl<A: VAddr> Page<A> {
         self.ptr.is_some()
     }
 
-    // Safety: self must be mapped
+    /// # Safety
+    /// `self` must be mapped
     pub(crate) unsafe fn mem_protect(&mut self, memory_protections: MemoryProtections) {
         debug_assert!(self.is_mapped());
-        *self.page_flags.get_mut() = memory_protections.into_page_flags().bits();
+
+        let flags = self.page_flags.get_mut();
+        let mut new_flags = memory_protections.into_page_flags();
+        let old_flags = PageFlags::from_bits_retain(*flags);
+
+        if old_flags.contains(PageFlags::INSN_DIRTY) {
+            new_flags |= PageFlags::INSN_DIRTY
+        }
+
+        // if we had the execute permision; and then suddenly its gone
+        // that means we can no longer execute the instructions in this page
+        // therefore the page now contains dirty instructions
+        if old_flags.contains(PageFlags::EXECUTE) && !new_flags.contains(PageFlags::EXECUTE) {
+            new_flags |= PageFlags::INSN_DIRTY
+        }
+
+        *flags = new_flags.bits();
     }
 
     #[inline(always)]
@@ -159,19 +299,15 @@ impl<A: VAddr> Page<A> {
     }
 
     #[inline(always)]
-    pub(crate) fn set_insn_dirty(&self) {
-        let initial_flags = self.load_flags();
-        if initial_flags.contains(PageFlags::EXECUTE) {
-            cold_path();
-            if !initial_flags.contains(PageFlags::INSN_DIRTY) {
-                cold_path();
-                self.page_flags.fetch_or(PageFlags::INSN_DIRTY.bits(), Ordering::Acquire);
-            }
-        }
+    pub(crate) fn load_flags_mut(&mut self) -> PageFlags {
+        PageFlags::from_bits_retain(*self.page_flags.get_mut())
     }
 
     #[inline(always)]
     fn has_access(&self, flags: PageFlags) -> bool {
+        if cfg!(debug_assertions) && self.ptr.is_none() {
+            assert!(self.load_flags().is_empty());
+        }
         self.load_flags().contains(flags)
     }
 
@@ -190,61 +326,93 @@ impl<A: VAddr> Page<A> {
     }
 
 
-    
+    /// Marks this page as requiring instruction-cache invalidation.
+    ///
+    /// This is called after every successful store. It only changes the page state
+    /// when the page is currently executable: writes to executable memory may change
+    /// the instruction stream, so any cached decoded/translated instructions for
+    /// this page must be invalidated before execution can safely use them again.
+    ///
+    /// This function must be called after the write permission check succeeds and
+    /// after the store operation succeeds.
     #[inline(always)]
-    unsafe fn access(
-        &self,
-        offset: usize,
-        len: usize,
-        flags: PageFlags,
-        mut op: impl FnMut(*const AtomicU8, usize),
-    ) -> Result<(), MemoryFault> {
-        let ptr = self.get_data_ptr(flags)?;
-        unsafe {
-            core::hint::assert_unchecked(len <= A::PAGE_SIZE.unchecked_sub(offset));
-            core::hint::assert_unchecked(ptr.addr().get().is_multiple_of(A::PAGE_SIZE));
-        }
-
-        unsafe {
-            let ptr = ptr.add(offset).as_ptr().cast_const();
-            for i in 0..len {
-                op(ptr.add(i), i)
+    pub(crate) fn set_insn_dirty(&self, initial_flags: PageFlags) {
+        if initial_flags.contains(PageFlags::EXECUTE) {
+            cold_path();
+            if !initial_flags.contains(PageFlags::INSN_DIRTY) {
+                cold_path();
+                // Use Release so that the successful guest write happens-before any thread that
+                // observes and consumes INSN_DIRTY with Acquire ordering. Once this bit becomes
+                // visible, the instruction-cache invalidation path must also be able to observe
+                // the memory contents that made the page dirty.
+                self.page_flags.fetch_or(PageFlags::INSN_DIRTY.bits(), Ordering::Release);
             }
         }
-        Ok(())
     }
 
+
+    pub(crate) fn take_insn_dirty(&self) -> bool {
+        // Use AcqRel because this operation both observes and clears INSN_DIRTY.
+        //
+        // Acquire pairs with the Release in set_insn_dirty, ensuring that if we observe
+        // the dirty bit, the writes that dirtied the executable page are visible before
+        // we invalidate cached instructions for it.
+        //
+        // Release covers the clearing side of the RMW: once we clear INSN_DIRTY, later
+        // observers must not treat the old dirty state as still pending through this
+        // operation.
+
+        let flag_bit = PageFlags::INSN_DIRTY.bits();
+        let mask = !flag_bit;
+        let old_flags = self.page_flags.fetch_and(mask, Ordering::AcqRel);
+        (old_flags & flag_bit) != 0
+    }
+
+
+    /// # Safety
+    ///
+    /// the whole store operation must fit in the page
     #[inline(always)]
     pub(crate) unsafe fn load(&self, offset: usize, mem: &mut [MaybeUninit<u8>]) -> Result<(), MemoryFault> {
         unsafe {
+            let page_ptr = self.get_data_ptr(PageFlags::READ)?;
+
+            let data_ptr = page_ptr.add(offset).as_ptr();
+
+            let len = mem.len();
             let mem_ptr = mem.as_mut_ptr().cast::<u8>();
-            self.access(
-                offset,
-                mem.len(),
-                PageFlags::READ,
-                move |ptr, i| {
-                    let value = A::load_byte(ptr);
-                    std::ptr::write(mem_ptr.add(i), value)
-                }
-            )
+
+            for i in 0..len {
+                let value = memops::load_byte(data_ptr.add(i));
+                std::ptr::write(mem_ptr.add(i), value)
+            }
+
+            Ok(())
         }
     }
 
+    /// # Safety
+    ///
+    /// the whole store operation must fit in the page
     #[inline(always)]
     pub(crate) unsafe fn store(&self, offset: usize, mem: &[u8]) -> Result<(), MemoryFault> {
-        unsafe {
-            let mem_ptr = mem.as_ptr();
-            self.access(
-                offset,
-                mem.len(),
-                PageFlags::WRITE,
-                move |ptr, i| {
-                    let value = std::ptr::read(mem_ptr.add(i));
-                    A::store_byte(ptr, value)
-                }
-            )?;
+        let flags = self.load_flags();
+        ensure!(flags.contains(PageFlags::WRITE));
 
-            self.set_insn_dirty();
+        unsafe {
+            let page_ptr = self.get_data_ptr_unchecked();
+
+            let write_ptr = page_ptr.add(offset).as_ptr();
+
+            let len = mem.len();
+            let mem_ptr = mem.as_ptr();
+
+            for i in 0..len {
+                let value = std::ptr::read(mem_ptr.add(i));
+                memops::store_byte(write_ptr.add(i), value)
+            }
+
+            self.set_insn_dirty(flags);
 
             Ok(())
         }
@@ -258,19 +426,18 @@ macro_rules! impl_load_ops {
         load_function: $load_op_name: ident,
         store_function: $store_op_name: ident,
         load: $load_name: ident,
-        fetch: $fetch_name: ident,
         store: $store_name: ident
         ),+
         $(,)?
     } => {
-        impl<A: VAddr> Page<A> {$(
+        impl Page {$(
             /// # Safety
             ///
-            #[doc = concat!("`offset` must be <= A::PAGE_SIZE - size_of<", stringify!($ty), ">()")]
+            #[doc = concat!("`offset` must be <= PAGE_SIZE - size_of::<", stringify!($ty), ">()")]
             #[inline(always)]
             pub(crate) unsafe fn $load_name(&self, offset: usize) -> Result<$ty, MemoryFault> {
                 let ptr = self.get_data_ptr(PageFlags::READ)?;
-                let value = unsafe { A::$load_op_name(ptr.as_ptr().add(offset)) };
+                let value = unsafe { memops::$load_op_name(ptr.as_ptr().add(offset)) };
                 Ok(value)
             }
 
@@ -279,12 +446,13 @@ macro_rules! impl_load_ops {
             #[doc = concat!("`offset` must be <= A::PAGE_SIZE - size_of<", stringify!($ty), ">()")]
             #[inline(always)]
             pub(crate) unsafe fn $store_name(&self, offset: usize, value: $ty) -> Result<(), MemoryFault> {
-                let ptr = self.get_data_ptr(PageFlags::WRITE)?;
-
-                unsafe { A::$store_op_name(ptr.as_ptr().add(offset), value) }
-
-                self.set_insn_dirty();
-
+                let flags = self.load_flags();
+                ensure!(flags.contains(PageFlags::WRITE));
+                unsafe {
+                    let ptr = self.get_data_ptr_unchecked();
+                    memops::$store_op_name(ptr.as_ptr().add(offset), value);
+                    self.set_insn_dirty(flags);
+                }
                 Ok(())
             }
         )+}
@@ -298,7 +466,6 @@ macro_rules! impl_load_ops {
                 load_function: [<load $bits _le>],
                 store_function: [<store $bits _le>],
                 load: [<load $bits>],
-                fetch: [<fetch $bits>],
                 store: [<store $bits>]
             ),+}
         }
@@ -313,35 +480,68 @@ impl_load_ops! {
     load_function: load_byte,
     store_function: store_byte,
     load: load_byte,
-    fetch: fetch_byte,
     store: store_byte
 }
 
+
+#[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub(crate) struct HostPointer(pub(crate) NonNull<AtomicU8>);
+
+impl HostPointer {
+    pub(crate) const fn new(ptr: NonNull<AtomicU8>) -> Self {
+        Self(ptr)
+    }
+}
+
+unsafe impl Send for HostPointer {}
+unsafe impl Sync for HostPointer {}
+
+
 /// Page-mapped virtual memory view over host-backed storage.
 ///
-/// `MMU<A>` maps virtual addresses of type `A` onto page-aligned host memory.
+/// `IoMMU` maps Armv9 virtual addresses onto page-aligned host memory.
 /// Access permissions are checked per page, and invalid access returns
 /// [`MemoryFault`].
 ///
-/// The implementation permits concurrent access and models tearing behavior
-/// explicitly for multi-byte operations.
-pub struct MMU<VAddr> {
-    pages: Vec<Page<VAddr>>,
+/// The implementation permits concurrent access and models the armv9 memory model.
+pub struct IoMMU {
+    pages: Vec<Page>,
+    pending_dirty_pages: Mutex<HashSet<HostPointer>>,
+    // FIXME whenever a write is in
+    //       range of an active monitor,
+    //       invalidate it and lock it,
+    //       until the store is complete
+    fabric: CpuFabric,
 }
 
 // Safety: all interior mutability is guarded explicitly with mutable references;
 //         and all access is atomic/tearing and doesn't lead to UB
-unsafe impl<A> Send for MMU<A> {}
-unsafe impl<A> Sync for MMU<A> {}
+unsafe impl Send for IoMMU {}
+unsafe impl Sync for IoMMU {}
 
-impl<A: VAddr> MMU<A> {
+impl IoMMU {
     /// Creates an empty MMU with no mapped pages.
     ///
-    /// All accesses fault until memory is mapped with [`MMU::map_memory`].
-    pub fn new() -> Self {
+    /// All accesses fault until memory is mapped with [`IoMMU::map_memory`].
+    pub fn new(fabric: CpuFabric) -> Self {
         Self {
-            pages: vec![]
+            pages: vec![],
+            pending_dirty_pages: Mutex::new(HashSet::new()),
+            fabric
         }
+    }
+
+    pub fn get_fabric(&self) -> &CpuFabric {
+        &self.fabric
+    }
+
+    fn unmap_page(page: &mut Page, pending_dirty_pages: &mut HashSet<HostPointer>) {
+        if page.load_flags_mut().contains(PageFlags::INSN_DIRTY) {
+            let page = unsafe { page.get_data_ptr_unchecked() };
+            pending_dirty_pages.insert(HostPointer::new(page));
+        }
+        page.unmap()
     }
 
 
@@ -366,8 +566,7 @@ impl<A: VAddr> MMU<A> {
     /// - the pointed-to memory is valid for both reads and writes at the host-memory
     ///   level, regardless of the guest permissions applied by `protections`,
     /// - the backing memory is not accessed directly while this mapping is alive,
-    ///   except by other MMU mappings that obey the same aliasing and concurrency
-    ///   rules,
+    ///   except by other MMUs that use the same `CpuFabric`
     /// - the backing memory remains page-aligned and is not deallocated, reallocated,
     ///   or otherwise invalidated while mapped.
     ///
@@ -377,83 +576,86 @@ impl<A: VAddr> MMU<A> {
     /// Returns [`MemoryFault`] if alignment or address validation fails.
     pub unsafe fn map_memory(
         &mut self,
-        base: A,
+        base: u64,
         ptr: *mut u8,
-        size: A,
+        size: u64,
         protections: MemoryProtections,
     ) -> Result<(), MemoryFault> {
-        ensure!(
-            base.add_addr(size).is_some(),
-            base.is_page_aligned(),
-            size.is_page_aligned(),
-            ptr.addr().is_multiple_of(A::PAGE_SIZE)
-        );
+        ensure!(ptr.addr().is_multiple_of(PAGE_SIZE));
 
-        let end_vaddr = base
-            .add_addr(size)
-            .ok_or_else(MemoryFault::fault)?;
+        let start_vaddr = base;
+        let end_vaddr = base.checked_add(size).ok_or_else(MemoryFault::fault)?;
 
-        // Safety: both base and size are page aligned, and if a mod x = 0 and b mod x = 0
-        //         then (a + b) mod x = 0
-        let end_page = unsafe { end_vaddr.div_page_size_unchecked() };
+        let end_page = div_page_size_checked(end_vaddr)?;
+        let start_page = div_page_size_checked(start_vaddr)?;
 
-        let Some(end_page) = end_page.try_to_usize() else {
+        let Some(end_page) = u64_to_usize(end_page) else {
             panic!("could not map pages into view; out of host memory")
         };
 
         unsafe {
             // Safety: start page is smaller than end page, and end page fits in ram
-            let start_page = base.div_page_size_unchecked().try_to_usize().unwrap_unchecked();
+            let start_page = u64_to_usize(start_page).unwrap_unchecked();
 
             if self.pages.len() < end_page {
                 self.pages.resize_with(end_page, || Page::UNMAPPED)
             }
 
+
             let base_ptr = NonNull::new_unchecked(ptr.cast::<AtomicU8>());
             for page_idx in start_page..end_page {
                 let page = self.pages.get_unchecked_mut(page_idx);
+                Self::unmap_page(page, self.pending_dirty_pages.get_mut());
                 let backing_page_idx = page_idx.unchecked_sub(start_page);
-                *page = Page::mapped(
-                    base_ptr.add(backing_page_idx.unchecked_mul(A::PAGE_SIZE)),
-                    protections
-                );
+                let page_ptr = base_ptr.add(backing_page_idx.unchecked_mul(PAGE_SIZE));
+                *page = Page::mapped(page_ptr, protections);
             }
         }
 
         Ok(())
     }
 
-    fn get_pages_mut(&mut self, start: A, size: A) -> Result<&mut [Page<A>], MemoryFault> {
-        let end = start.add_addr(size).ok_or_else(MemoryFault::fault)?;
-        let (end_page, end_remainder) = end.div_rem_page_size();
-        let (start_page, start_remainder) = start.div_rem_page_size();
+    fn get_pages_mut(
+        &mut self,
+        start: u64,
+        size: u64
+    ) -> Result<(&mut [Page], &mut HashSet<HostPointer>), MemoryFault> {
+        let end = start.checked_add(size).ok_or_else(MemoryFault::fault)?;
+        let end_page = div_page_size_checked(end)?;
+        let start_page = div_page_size_checked(start)?;
 
-        ensure!(end_remainder == 0, start_remainder == 0);
-
-        let (start_page, end_page) = start_page
-            .try_to_usize()
-            .and_then(|start_page| Some((start_page, end_page.try_to_usize()?)))
+        let (start_page, end_page) = usize::try_from(start_page)
+            .and_then(|start_page| Ok((start_page, usize::try_from(end_page)?)))
+            .ok()
             .ok_or_else(MemoryFault::fault)?;
 
 
-        self.pages.get_mut(start_page..end_page).ok_or_else(MemoryFault::fault)
+        let pages = self
+            .pages
+            .get_mut(start_page..end_page)
+            .ok_or_else(MemoryFault::fault)?;
+
+        Ok((pages, self.pending_dirty_pages.get_mut()))
     }
 
 
-    pub fn unmap_memory(&mut self, start: A, size: A) -> Result<(), MemoryFault> {
-        for page in self.get_pages_mut(start, size)? {
-            page.unmap()
+    pub fn unmap_memory(&mut self, start: u64, size: u64) -> Result<(), MemoryFault> {
+        let (pages, pending_dirty_pages) = self.get_pages_mut(start, size)?;
+        for page in pages {
+            Self::unmap_page(page, pending_dirty_pages);
         }
         Ok(())
     }
 
     pub fn mem_protect(
         &mut self,
-        start: A,
-        size: A,
+        start: u64,
+        size: u64,
         protections: MemoryProtections
     ) -> Result<(), MemoryFault> {
-        let pages = self.get_pages_mut(start, size)?;
+        // changing memory protections doesn't change the mapping of the host pointer
+        // therefore there is no need to touch the pending dirty pages
+        let (pages, _) = self.get_pages_mut(start, size)?;
         for page in &mut *pages {
             ensure!(page.is_mapped());
         }
@@ -471,22 +673,23 @@ impl<A: VAddr> MMU<A> {
     /// `vaddr_start` <= `vaddr_end`
     unsafe fn for_each_page_chunk(
         &self,
-        vaddr_start: A,
-        vaddr_end: A,
+        vaddr_start: u64,
+        vaddr_end: u64,
         required: PageFlags,
-        mut f: impl FnMut(&Page<A>, usize, usize, usize),
+        mut f: impl FnMut(&Page, usize, usize, usize),
     ) -> Result<(), MemoryFault> {
         unsafe { core::hint::assert_unchecked(vaddr_start <= vaddr_end) }
 
-        let (end_page, end_offset) = vaddr_end.div_rem_page_size();
-        let end_page = end_page.try_to_usize().ok_or_else(MemoryFault::fault)?;
+        let (end_page, end_offset) = div_rem_page_size(vaddr_end);
+        let end_page = u64_to_usize(end_page).ok_or_else(MemoryFault::fault)?;
 
         ensure!(end_page < self.pages.len());
 
-        let (start_page, start_offset) = vaddr_start.div_rem_page_size();
+        let (start_page, start_offset) = div_rem_page_size(vaddr_start);
         // Safety: end_page fits in usize and end_page >= start_page
-        let start_page = unsafe { start_page.try_to_usize().unwrap_unchecked() };
+        let start_page = unsafe { u64_to_usize(start_page).unwrap_unchecked() };
 
+        // Safety: start_page < end_page < self.pages.len()
         let pages = unsafe { self.pages.get_unchecked(start_page..=end_page) };
         for page in pages {
             ensure!(page.has_access(required))
@@ -503,7 +706,7 @@ impl<A: VAddr> MMU<A> {
                 // so this can be incremented safely
                 unsafe { end_offset.unchecked_add(1) }
             } else {
-                A::PAGE_SIZE
+                PAGE_SIZE
             };
 
             let chunk_len = unsafe { page_end.unchecked_sub(page_off) };
@@ -517,18 +720,17 @@ impl<A: VAddr> MMU<A> {
 
     fn for_each_page_chunk_len(
         &self,
-        vaddr: A,
+        vaddr: u64,
         len: usize,
         required: PageFlags,
-        f: impl FnMut(&Page<A>, usize, usize, usize),
+        f: impl FnMut(&Page, usize, usize, usize),
     ) -> Result<(), MemoryFault> {
         if len == 0 {
             return Ok(())
         }
 
         let extra = unsafe { len.unchecked_sub(1) };
-
-        let end = vaddr.add_offset(extra).ok_or_else(MemoryFault::fault)?;
+        let end = u64_add_usize(vaddr, extra).ok_or_else(MemoryFault::fault)?;
         // Safety: end is vaddr + len, with no overflow, and so this it must be bigger
         unsafe {
             self.for_each_page_chunk(
@@ -558,7 +760,7 @@ impl<A: VAddr> MMU<A> {
     /// This safe function must not invoke undefined behavior.
     pub fn load<'a>(
         &self,
-        vaddr: A,
+        vaddr: u64,
         mem: &'a mut [MaybeUninit<u8>]
     ) -> Result<&'a mut [u8], MemoryFault> {
         let result = self.for_each_page_chunk_len(
@@ -590,7 +792,7 @@ impl<A: VAddr> MMU<A> {
     ///
     /// This safe function must not invoke undefined behavior.
     #[inline(always)]
-    pub fn store(&self, vaddr: A, mem: &[u8]) -> Result<(), MemoryFault> {
+    pub fn store(&self, vaddr: u64, mem: &[u8]) -> Result<(), MemoryFault> {
         self.for_each_page_chunk_len(
             vaddr,
             mem.len(),
@@ -604,31 +806,30 @@ impl<A: VAddr> MMU<A> {
     }
 }
 
-struct SecondPage<'a, A: VAddr> {
-    page: &'a Page<A>,
+struct SecondPage<'a> {
+    page: &'a Page,
     overflow_amount: NonZero<u8>,
 }
 
-struct SmallAccess<'a, A: VAddr> {
-    base_page: &'a Page<A>,
+struct SmallAccess<'a> {
+    base_page: &'a Page,
     base_page_offset: usize,
-    second_page: Option<SecondPage<'a, A>>
+    second_page: Option<SecondPage<'a>>
 }
 
-impl<A: VAddr> MMU<A> {
+impl IoMMU {
     fn static_small_multibyte_acces<const BYTES: u8>(
         &self,
-        vaddr: A
-    ) -> Result<SmallAccess<'_, A>, MemoryFault> {
+        vaddr: u64,
+    ) -> Result<SmallAccess<'_>, MemoryFault> {
         const {
             assert!(BYTES > 1);
-            assert!((BYTES as usize) < A::PAGE_SIZE);
-            assert!(A::PAGE_SIZE.checked_add(BYTES as usize).is_some());
+            assert!((BYTES as usize) < PAGE_SIZE);
+            assert!(PAGE_SIZE.checked_add(BYTES as usize).is_some());
         }
 
-        let (base_page_idx, base_page_offset) = vaddr.div_rem_page_size();
-        let (base_page_idx, base_page) = base_page_idx
-            .try_to_usize()
+        let (base_page_idx, base_page_offset) = div_rem_page_size(vaddr);
+        let (base_page_idx, base_page) = u64_to_usize(base_page_idx)
             .and_then(|page_idx| Some((page_idx, self.pages.get(page_idx)?)))
             .ok_or_else(MemoryFault::fault)?;
 
@@ -636,12 +837,12 @@ impl<A: VAddr> MMU<A> {
 
         let end_offset = unsafe { base_page_offset.unchecked_add(usize::from(BYTES)) };
 
-        let second_page = match end_offset > A::PAGE_SIZE {
+        let second_page = match end_offset > PAGE_SIZE {
             false => None,
             true => {
                 cold_path();
                 let overflow_amount = unsafe {
-                    u8::try_from(end_offset.unchecked_sub(A::PAGE_SIZE)).unwrap_unchecked()
+                    u8::try_from(end_offset.unchecked_sub(PAGE_SIZE)).unwrap_unchecked()
                 };
 
                 unsafe { core::hint::assert_unchecked(overflow_amount < BYTES) }
@@ -674,7 +875,7 @@ impl<A: VAddr> MMU<A> {
 macro_rules! emit_multi_word_load_store {
     ($($bits: tt),+ $(,)?) => {
         pastey::paste! {
-            impl<A: VAddr> MMU<A> {$(
+            impl IoMMU {$(
                 /// Loads a little-endian scalar from virtual memory.
                 ///
                 /// The access requires read permission for every page it touches. If the access
@@ -689,7 +890,7 @@ macro_rules! emit_multi_word_load_store {
                 ///
                 /// This safe function must not invoke undefined behavior.
                 #[inline(always)]
-                pub fn [<load $bits _le>](&self, vaddr: A) -> Result<[<u $bits>], MemoryFault> {
+                pub fn [<load $bits _le>](&self, vaddr: u64) -> Result<[<u $bits>], MemoryFault> {
                     let access = self.static_small_multibyte_acces::<{ $bits / 8 }>(vaddr)?;
                     match access.second_page {
                         // SAFETY:
@@ -698,7 +899,7 @@ macro_rules! emit_multi_word_load_store {
                         //
                         // Therefore:
                         //
-                        //   base_page_offset + size_of::<u$bits>() <= A::PAGE_SIZE
+                        //   base_page_offset + size_of::<u$bits>() <= PAGE_SIZE
                         //
                         // which satisfies the safety requirement of `Page::load$bits`.
                         None => unsafe { access.base_page.[<load $bits>](access.base_page_offset) },
@@ -728,27 +929,19 @@ macro_rules! emit_multi_word_load_store {
                             // In the crossing case:
                             //
                             //   end_offset      = base_page_offset + BYTES
-                            //   overflow_amount = end_offset - A::PAGE_SIZE
+                            //   overflow_amount = end_offset - PAGE_SIZE
                             //
                             // Therefore:
                             //
                             //   base_page_offset - overflow_amount
-                            // = base_page_offset - (base_page_offset + BYTES - A::PAGE_SIZE)
-                            // = A::PAGE_SIZE - BYTES
-                            //
-                            // Since `static_small_multibyte_acces` guarantees
-                            // `BYTES < A::PAGE_SIZE`, this subtraction cannot underflow.
-                            //
-                            // The result is the offset of a full `$bits`-wide word ending
-                            // exactly at the end of the base page.
-                            let lo_offset = access
-                                .base_page_offset
-                                .unchecked_sub(usize::from(second_page.overflow_amount.get()));
+                            // = base_page_offset - (base_page_offset + BYTES - PAGE_SIZE)
+                            // = PAGE_SIZE - BYTES
+                            let lo_offset = const { PAGE_SIZE.strict_sub($bits / 8) };
 
                             // SAFETY:
                             // `hi_page_ptr` points to the start of the second page's readable
                             // data. Offset `0` is valid for a full `$bits`-wide load because
-                            // `BYTES == $bits / 8` and `BYTES < A::PAGE_SIZE`.
+                            // `BYTES == $bits / 8` and `BYTES < PAGE_SIZE`.
                             //
                             // The aligned operation is valid because page data is assumed to be
                             // aligned sufficiently for these aligned page-boundary loads.
@@ -757,7 +950,7 @@ macro_rules! emit_multi_word_load_store {
                             // SAFETY:
                             // From the proof above:
                             //
-                            //   lo_offset == A::PAGE_SIZE - BYTES
+                            //   lo_offset == PAGE_SIZE - BYTES
                             //
                             // so `lo_ptr` points to the first byte of the final `$bits`-wide
                             // word in the base page.
@@ -766,13 +959,13 @@ macro_rules! emit_multi_word_load_store {
                             // ends exactly at the page boundary.
                             //
                             // The aligned operation is valid because this pointer is page-end
-                            // aligned for a `$bits`-wide word, assuming `A::PAGE_SIZE` is a
+                            // aligned for a `$bits`-wide word, assuming `PAGE_SIZE` is a
                             // multiple of `BYTES`.
                             let lo_ptr = lo_page_ptr.byte_add(lo_offset).as_ptr();
 
 
-                            let hi = A::[<load $bits _le_aligned>](hi_ptr);
-                            let lo = A::[<load $bits _le_aligned>](lo_ptr);
+                            let hi = memops::[<load $bits _le_aligned>](hi_ptr);
+                            let lo = memops::[<load $bits _le_aligned>](lo_ptr);
 
                             // SAFETY:
                             // `overflow_amount` is a `NonZero<u8>`, so it is at least `1`.
@@ -830,7 +1023,7 @@ macro_rules! emit_multi_word_load_store {
                 ///
                 /// This safe function must not invoke undefined behavior.
                 #[inline(always)]
-                pub fn [<store $bits _le>](&self, vaddr: A, value: [<u $bits>]) -> Result<(), MemoryFault> {
+                pub fn [<store $bits _le>](&self, vaddr: u64, value: [<u $bits>]) -> Result<(), MemoryFault> {
                     let access = self.static_small_multibyte_acces::<{ $bits / 8 }>(vaddr)?;
 
                     match access.second_page {
@@ -853,8 +1046,19 @@ macro_rules! emit_multi_word_load_store {
                             //       next to the value
                             let bytes = value.to_le_bytes();
 
-                            let hi_page_ptr = second_page.page.get_data_ptr(PageFlags::WRITE)?;
-                            let lo_page_ptr = access.base_page.get_data_ptr(PageFlags::WRITE)?;
+                            let hi_page = &second_page.page;
+                            let lo_page = &access.base_page;
+
+                            let hi_page_flags = hi_page.load_flags();
+                            let lo_page_flags = lo_page.load_flags();
+
+                            ensure!(
+                                hi_page_flags.contains(PageFlags::WRITE),
+                                lo_page_flags.contains(PageFlags::WRITE),
+                            );
+
+                            let hi_page_ptr = hi_page.get_data_ptr_unchecked();
+                            let lo_page_ptr = lo_page.get_data_ptr_unchecked();
 
                             let overflow = usize::from(second_page.overflow_amount.get());
 
@@ -865,17 +1069,17 @@ macro_rules! emit_multi_word_load_store {
                                 active_ptr = active_ptr.sub(1);
                                 i = i.unchecked_sub(1);
                                 let byte = *bytes.get_unchecked(i);
-                                A::store_byte(active_ptr, byte)
+                                memops::store_byte(active_ptr, byte)
                             }
 
                             active_ptr = lo_page_ptr
-                                .add(const { A::PAGE_SIZE.strict_sub(1) })
+                                .add(const { PAGE_SIZE.strict_sub(1) })
                                 .as_ptr();
 
                             loop {
                                 i = i.unchecked_sub(1);
                                 let byte = *bytes.get_unchecked(i);
-                                A::store_byte(active_ptr, byte);
+                                memops::store_byte(active_ptr, byte);
 
                                 if i == 0 {
                                     break
@@ -883,9 +1087,8 @@ macro_rules! emit_multi_word_load_store {
                                 active_ptr = active_ptr.sub(1)
                             }
 
-
-                            access.base_page.set_insn_dirty();
-                            second_page.page.set_insn_dirty();
+                            lo_page.set_insn_dirty(lo_page_flags);
+                            hi_page.set_insn_dirty(hi_page_flags);
                             Ok(())
                         }
                     }
@@ -897,39 +1100,35 @@ macro_rules! emit_multi_word_load_store {
 
 emit_multi_word_load_store! { 64, 32, 16 }
 
-impl<A: VAddr> MMU<A> {
+impl IoMMU {
     pub(crate) fn single_page_aligned_access<const ALIGN: u8>(
         &self,
-        vaddr: A
-    ) -> Result<(&Page<A>, usize), MemoryFault> {
+        vaddr: u64
+    ) -> Result<(&Page, usize), MemoryFault> {
         const {
             assert!(ALIGN.is_power_of_two());
-            assert!(A::PAGE_SIZE.is_power_of_two());
-            assert!(A::PAGE_SIZE.is_multiple_of(ALIGN as usize));
+            assert!(PAGE_SIZE.is_power_of_two());
+            assert!(PAGE_SIZE.is_multiple_of(ALIGN as usize));
         }
 
-        ensure!(vaddr.is_multiple_of(A::from(ALIGN)));
+        ensure!(vaddr.is_multiple_of(u64::from(ALIGN)));
 
-        let (page, offset) = vaddr.div_rem_page_size();
-        let page = page
-            .try_to_usize()
+        let (page, offset) = div_rem_page_size(vaddr);
+        let page = u64_to_usize(page)
             .and_then(|page_idx| self.pages.get(page_idx))
             .ok_or_else(MemoryFault::fault)?;
 
         Ok((page, offset))
     }
 
-    pub fn load_byte(&self, vaddr: A) -> Result<u8, MemoryFault> {
+    pub fn load_byte(&self, vaddr: u64) -> Result<u8, MemoryFault> {
         const ALIGN: u8 = 1;
-        unsafe {
-            // Safety: no store is done to the page
-            let (page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
-            // Safety: offset is the result of x % PAGE_SIZE and so must be smaller than page size
-            page.load_byte(offset)
-        }
+        let (page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
+        // Safety: offset is the result of x % PAGE_SIZE and so must be smaller than page size
+        unsafe { page.load_byte(offset) }
     }
 
-    pub fn store_byte(&self, vaddr: A, value: u8) -> Result<(), MemoryFault> {
+    pub fn store_byte(&self, vaddr: u64, value: u8) -> Result<(), MemoryFault> {
         const ALIGN: u8 = 1;
         let (page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
         // Safety: offset is the result of x % PAGE_SIZE and so must be smaller than page size
@@ -938,16 +1137,46 @@ impl<A: VAddr> MMU<A> {
 }
 
 
-impl<A: VAddr> MMU<A> {
-    pub fn fetch(&self, vaddr: A) -> Result<A::InsnWord, MemoryFault> {
-        A::fetch_insn_word(vaddr, self)
+impl IoMMU {
+    pub(crate) fn fetch_aarch64_full(&self, vaddr: u64) -> Result<(HostPointer, u32), MemoryFault> {
+        const ALIGN: u8 = 4;
+        let (page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
+        let data_ptr = page.get_data_ptr(PageFlags::EXECUTE)?;
+        unsafe {
+            let word_ptr = data_ptr.add(offset);
+            let word = memops::load32_le_aligned(word_ptr.as_ptr());
+            Ok((HostPointer::new(word_ptr), word))
+        }
+    }
+
+    pub fn fetch_aarch64(&self, vaddr: u64) -> Result<u32, MemoryFault> {
+        self.fetch_aarch64_full(vaddr).map(|(_ptr, word)| word)
+    }
+
+    pub(crate) fn drain_dirty_icache(&self) -> impl Iterator<Item=Range<HostPointer>> {
+        let mut dirty_pages = {
+            let mut lock = self.pending_dirty_pages.lock();
+            core::mem::take(&mut *lock)
+        };
+
+        for page in &self.pages {
+            if page.take_insn_dirty() {
+                let page_ptr = unsafe { page.get_data_ptr_unchecked() };
+                dirty_pages.insert(HostPointer::new(page_ptr));
+            }
+        }
+
+        dirty_pages.into_iter().map(|ptr| {
+            let page_start = ptr;
+            let page_end = HostPointer::new(unsafe { ptr.0.add(PAGE_SIZE) });
+            page_start..page_end
+        })
     }
 }
 
-
-impl<A: VAddr> Default for MMU<A> {
-    fn default() -> Self {
-        Self::new()
+impl IoMMU {
+    pub(crate) fn pages(&self) -> &[Page] {
+        &self.pages
     }
 }
 
@@ -961,8 +1190,6 @@ mod mmu_tests {
     use std::ptr::NonNull;
 
     const BASE: u64 = 0;
-
-    const PAGE_SIZE: usize = <u64 as crate::vaddr::sealed::VAddr>::PAGE_SIZE;
 
     fn page_size() -> usize {
         PAGE_SIZE
@@ -1029,7 +1256,7 @@ mod mmu_tests {
     }
 
     struct Fixture {
-        mmu: MMU<u64>,
+        mmu: IoMMU,
         _backing: PageBacking,
     }
 
@@ -1051,7 +1278,7 @@ mod mmu_tests {
                 }
             }
 
-            let mut mmu = MMU::<u64>::new();
+            let mut mmu = IoMMU::new(CpuFabric::new());
             unsafe {
                 mmu.map_memory(
                     BASE,
@@ -1086,7 +1313,7 @@ mod mmu_tests {
                 }
             }
 
-            let mut mmu = MMU::<u64>::new();
+            let mut mmu = IoMMU::new(CpuFabric::new());
             for (page, protections) in protections.iter().copied().enumerate() {
                 unsafe {
                     mmu.map_memory(
@@ -1120,7 +1347,7 @@ mod mmu_tests {
 
     #[test]
     fn new_mmu_faults_non_empty_accesses() {
-        let mmu = MMU::<u64>::new();
+        let mmu = IoMMU::new(CpuFabric::new());
 
         let mut one = [MaybeUninit::<u8>::uninit()];
         assert!(mmu.load(BASE, &mut one).is_err());
@@ -1140,7 +1367,7 @@ mod mmu_tests {
 
     #[test]
     fn zero_length_load_and_store_do_not_require_mapping() {
-        let mmu = MMU::<u64>::new();
+        let mmu = IoMMU::new(CpuFabric::new());
 
         let mut empty: [MaybeUninit<u8>; 0] = [];
 
@@ -1153,7 +1380,7 @@ mod mmu_tests {
     #[test]
     fn map_memory_rejects_unaligned_base_size_ptr_and_overflow() {
         let mut backing = PageBacking::new(2);
-        let mut mmu = MMU::<u64>::new();
+        let mut mmu = IoMMU::new(CpuFabric::new());
 
         unsafe {
             assert!(mmu
@@ -1203,7 +1430,7 @@ mod mmu_tests {
             backing.as_mut_slice()[0] = 0xaa;
         }
 
-        let mut mmu = MMU::<u64>::new();
+        let mut mmu = IoMMU::new(CpuFabric::new());
         let base = page_addr(2);
 
         unsafe {
@@ -1693,7 +1920,7 @@ mod mmu_tests {
             }
         }
 
-        let mut mmu = MMU::<u64>::new();
+        let mut mmu = IoMMU::new(CpuFabric::new());
         let page = page_size() as u64;
 
         unsafe {
@@ -1836,7 +2063,7 @@ mod mmu_tests {
 
     #[test]
     fn unmap_memory_allows_zero_sized_noop_at_start() {
-        let mut mmu = MMU::<u64>::new();
+        let mut mmu = IoMMU::new(CpuFabric::new());
 
         assert!(mmu.unmap_memory(BASE, 0).is_ok());
     }
@@ -2072,7 +2299,100 @@ mod mmu_tests {
 
     #[test]
     fn mem_protect_allows_zero_sized_noop_at_start() {
-        let mut mmu = MMU::<u64>::new();
+        let mut mmu = IoMMU::new(CpuFabric::new());
         assert!(mmu.mem_protect(BASE, 0, MemoryProtections::READ).is_ok());
+    }
+
+    #[test]
+    fn unaligned_scalar_loads_inside_page_succeed() {
+        let fixture = Fixture::with_bytes(
+            1,
+            MemoryProtections::READ | MemoryProtections::WRITE,
+            pattern_byte,
+        );
+
+        assert_eq!(
+            fixture.mmu.load16_le(1).unwrap(),
+            u16::from_le_bytes(pattern_array::<2>(1))
+        );
+
+        assert_eq!(
+            fixture.mmu.load32_le(1).unwrap(),
+            u32::from_le_bytes(pattern_array::<4>(1))
+        );
+
+        assert_eq!(
+            fixture.mmu.load64_le(1).unwrap(),
+            u64::from_le_bytes(pattern_array::<8>(1))
+        );
+    }
+
+    #[test]
+    fn unaligned_scalar_stores_inside_page_succeed() {
+        let fixture = Fixture::new(1, MemoryProtections::READ | MemoryProtections::WRITE);
+
+        fixture.mmu.store16_le(1, 0xbeef).unwrap();
+        assert_eq!(fixture.read_vec(1, 2), 0xbeefu16.to_le_bytes().to_vec());
+
+        fixture.mmu.store32_le(3, 0xaabb_ccdd).unwrap();
+        assert_eq!(fixture.read_vec(3, 4), 0xaabb_ccddu32.to_le_bytes().to_vec());
+
+        fixture.mmu.store64_le(5, 0x0123_4567_89ab_cdef).unwrap();
+        assert_eq!(
+            fixture.read_vec(5, 8),
+            0x0123_4567_89ab_cdefu64.to_le_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn failed_crossing_scalar_store_does_not_write_first_page_when_second_page_lacks_write() {
+        let fixture = Fixture::with_page_protections_and_bytes(
+            &[
+                MemoryProtections::READ | MemoryProtections::WRITE,
+                MemoryProtections::READ,
+            ],
+            pattern_byte,
+        );
+
+        let start = (page_size() - 1) as u64;
+        let before = fixture.mmu.load_byte(start).unwrap();
+
+        assert!(fixture.mmu.store16_le(start, 0xbeef).is_err());
+
+        assert_eq!(fixture.mmu.load_byte(start).unwrap(), before);
+    }
+
+    #[test]
+    fn failed_crossing_scalar_store_does_not_write_second_page_when_first_page_lacks_write() {
+        let fixture = Fixture::with_page_protections_and_bytes(
+            &[
+                MemoryProtections::READ,
+                MemoryProtections::READ | MemoryProtections::WRITE,
+            ],
+            pattern_byte,
+        );
+
+        let start = (page_size() - 1) as u64;
+        let second_page_before = fixture.mmu.load_byte(page_addr(1)).unwrap();
+
+        assert!(fixture.mmu.store16_le(start, 0xbeef).is_err());
+
+        assert_eq!(fixture.mmu.load_byte(page_addr(1)).unwrap(), second_page_before);
+    }
+
+    #[test]
+    fn scalar_accesses_near_u64_max_fault_instead_of_wrapping() {
+        let fixture = Fixture::new(1, MemoryProtections::READ | MemoryProtections::WRITE);
+
+        assert!(fixture.mmu.load16_le(u64::MAX).is_err());
+        assert!(fixture.mmu.load32_le(u64::MAX - 1).is_err());
+        assert!(fixture.mmu.load64_le(u64::MAX - 3).is_err());
+
+        assert!(fixture.mmu.store16_le(u64::MAX, 0xbeef).is_err());
+        assert!(fixture.mmu.store32_le(u64::MAX - 1, 0xaabb_ccdd).is_err());
+        assert!(fixture
+            .mmu
+            .store64_le(u64::MAX - 3, 0x0123_4567_89ab_cdef)
+            .is_err());
     }
 }

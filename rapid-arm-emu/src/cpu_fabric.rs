@@ -14,31 +14,93 @@
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use crossbeam_utils::CachePadded;
-use crate::sync::Mutex;
-use crate::vaddr;
-use crate::vaddr::VAddr;
+use crate::mmu::HostPointer;
+use parking_lot::Mutex;
+
+
+pub(crate) const BUCKET_COUNT: u16 = 257;
+
+struct SplitMixConstants {
+    shift1: u32,
+    c1: usize,
+    shift2: u32,
+    c2: usize,
+    shift3: u32,
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "usize's size is checked and we only convert from the native size"
+)]
+const SPLIT_MIX_CONSTANTS: SplitMixConstants = match usize::BITS {
+    // 128 bit targets are exotic,
+    // and never seen, but if tehy ever come out, just use the low 64 bits
+    64.. => SplitMixConstants {
+        shift1: 30,
+        c1: 0xbf58_476d_1ce4_e5b9_u64 as usize,
+        shift2: 27,
+        c2: 0x94d0_49bb_1331_11eb_u64 as usize,
+        shift3: 31,
+    },
+
+    32 => SplitMixConstants {
+        shift1: 16,
+        c1: 0x7feb_352d_u32 as usize,
+        shift2: 15,
+        c2: 0x846c_a68b_u32 as usize,
+        shift3: 16,
+    },
+
+    16 => SplitMixConstants {
+        shift1: 7,
+        c1: 0x2c1b_u16 as usize,
+        shift2: 9,
+        c2: 0x297a_u16 as usize,
+        shift3: 7,
+    },
+
+    _ => panic!("usize::BITS is a power of 2; that is at least 16 bits"),
+};
+
+#[inline(always)]
+fn reservation_index(ptr: HostPointer) -> usize {
+    let mut x = ptr.0.addr().get();
+    x ^= x >> SPLIT_MIX_CONSTANTS.shift1;
+    x = x.wrapping_mul(SPLIT_MIX_CONSTANTS.c1);
+    x ^= x >> SPLIT_MIX_CONSTANTS.shift2;
+    x = x.wrapping_mul(SPLIT_MIX_CONSTANTS.c2);
+    x ^= x >> SPLIT_MIX_CONSTANTS.shift3;
+    x.strict_rem(usize::from(BUCKET_COUNT))
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub(crate) struct Version(u64);
 
-pub(crate) struct ReservationToken<A: VAddr> {
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub(crate) enum ExclusiveMonitorLoad {
+    U128(u128),
+    U64(u64),
+    U32(u32),
+    U16(u16),
+    U8(u8),
+}
+
+pub(crate) struct ReservationToken {
     version: Version,
-    value: <A as vaddr::sealed::VAddr>::ExclusiveMonitorLoadValue,
+    value: ExclusiveMonitorLoad,
 }
 
-
-pub(crate) struct ReservationSlot<VAddr> {
-    address: VAddr,
+pub(crate) struct ReservationSlot {
+    ptr: Option<HostPointer>,
     version: Version,
 }
 
-pub(crate) const BUCKET_COUNT: u16 = 257;
 
-pub(crate) struct ExclusiveMonitor<VAddr> {
-    reservations: [CachePadded<Mutex<ReservationSlot<VAddr>>>; BUCKET_COUNT as usize],
+pub(crate) struct ExclusiveMonitor {
+    reservations: [CachePadded<Mutex<ReservationSlot>>; BUCKET_COUNT as usize],
 }
 
-impl<A: VAddr> ExclusiveMonitor<A> {
+impl ExclusiveMonitor {
 
     /// #
     pub fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
@@ -48,7 +110,7 @@ impl<A: VAddr> ExclusiveMonitor<A> {
                 std::ptr::write(
                     &raw mut (*ptr).reservations[usize::from(i)],
                     CachePadded::new(Mutex::new(ReservationSlot {
-                        address: A::NULL,
+                        ptr: None,
                         version: Version(0),
                     }))
                 )
@@ -67,13 +129,13 @@ impl<A: VAddr> ExclusiveMonitor<A> {
     #[must_use]
     pub(crate) fn ldrex(
         &self,
-        addr: A,
-        load_op: impl FnOnce() -> A::ExclusiveMonitorLoadValue,
-    ) -> ReservationToken<A> {
-        let reserve_idx = addr.reservation_index();
+        ptr: HostPointer,
+        load_op: impl FnOnce() -> ExclusiveMonitorLoad,
+    ) -> ReservationToken {
+        let reserve_idx = reservation_index(ptr);
         let mut lock = self.reservations[reserve_idx].lock();
 
-        lock.address = addr;
+        lock.ptr = Some(ptr);
         let version = lock.version;
 
         let value = load_op();
@@ -85,14 +147,14 @@ impl<A: VAddr> ExclusiveMonitor<A> {
 
     pub(crate) fn strex<T>(
         &self,
-        addr: A,
-        tok: ReservationToken<A>,
-        store_op: impl FnOnce(A::ExclusiveMonitorLoadValue) -> Result<T, ()>,
+        ptr: HostPointer,
+        tok: ReservationToken,
+        store_op: impl FnOnce(ExclusiveMonitorLoad) -> Result<T, ()>,
     ) -> Result<T, ()> {
-        let reserve_idx = addr.reservation_index();
+        let reserve_idx = reservation_index(ptr);
         let mut lock = self.reservations[reserve_idx].lock();
 
-        if lock.address != addr || lock.version != tok.version {
+        if lock.ptr != Some(ptr) || lock.version != tok.version {
             return Err(());
         }
 
@@ -105,54 +167,38 @@ impl<A: VAddr> ExclusiveMonitor<A> {
     }
 }
 
+#[derive(Clone)]
 #[repr(transparent)]
-pub struct CpuFabric<VAddr>(Arc<ExclusiveMonitor<VAddr>>);
+pub struct CpuFabric(Arc<ExclusiveMonitor>);
 
-impl<A: VAddr> CpuFabric<A> {
+impl CpuFabric {
     pub fn new() -> Self {
         Self(ExclusiveMonitor::new_arc())
     }
 }
 
-impl<A> Clone for CpuFabric<A> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        if !Arc::ptr_eq(&self.0, &source.0) {
-            *self = source.clone();
-        }
-    }
-}
-
-impl<A: VAddr> Default for CpuFabric<A> {
+impl Default for CpuFabric {
     fn default() -> Self {
         Self::new()
     }
 }
 
 const _: () = {
-    fn _assert_sync<A: VAddr>() {
-        fn is_sync<T: Sync>() {}
+    const fn is_sync<T: Sync>() {}
+    const fn is_send<T: Send>() {}
 
-        is_sync::<CpuFabric<A>>()
-    }
-
-    fn _assert_send<A: VAddr>() {
-        fn is_send<T: Send>() {}
-
-        is_send::<CpuFabric<A>>()
-    }
+    is_sync::<CpuFabric>();
+    is_send::<CpuFabric>();
 };
 
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+    use std::ptr::NonNull;
     use super::*;
 
     use loom::sync::{Arc, Mutex, Condvar};
-    use crate::a64::sealed::ExclusiveMonitorLoad;
 
     struct BarrierState {
         count: usize,
@@ -201,7 +247,7 @@ mod tests {
         }
 
         loom::model(move || {
-            let monitor = Arc::from_std(ExclusiveMonitor::<u64>::new_arc());
+            let monitor = Arc::from_std(ExclusiveMonitor::new_arc());
             let memory = Arc::new(Mutex::new(0_u32));
             let barrier = Arc::new(Barrier::new(2));
 
@@ -210,11 +256,15 @@ mod tests {
                 let monitor = Arc::clone(&monitor);
                 let barrier = Arc::clone(&barrier);
                 loom::thread::spawn(move || {
-                    let addr = 0x10000DEAD00BEEF;
+                    let ptr = const {
+                        HostPointer::new(NonNull::without_provenance(
+                            NonZero::new(0x10000DEAD00BEEF).unwrap()
+                        ))
+                    };
 
-                    let token = monitor.ldrex(addr, || ExclusiveMonitorLoad::U8(0));
+                    let token = monitor.ldrex(ptr, || ExclusiveMonitorLoad::U8(0));
                     barrier.wait();
-                    let _ = monitor.strex(addr, token, |val| {
+                    let _ = monitor.strex(ptr, token, |val| {
                         match val {
                             ExclusiveMonitorLoad::U8(0) => {
                                 *memory.try_lock().unwrap() += 1;
