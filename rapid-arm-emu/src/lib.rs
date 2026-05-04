@@ -19,7 +19,7 @@
 mod ir;
 mod a64;
 pub mod cpu_fabric;
-pub mod mmu;
+pub mod io_mmu;
 pub mod vaddr;
 pub mod halt_reason;
 pub mod armv9;

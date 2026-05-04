@@ -3,7 +3,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use crate::armv9::{Armv9CpuCore, ProcessorState};
 use crate::halt_reason::HaltReasonInner;
-use crate::mmu::HostPointer;
+use crate::io_mmu::HostPointer;
 
 const MAX_INSTRUCTIONS_PER_BLOCK: NonZero<u32> = NonZero::new(16 * 1024).unwrap();
 

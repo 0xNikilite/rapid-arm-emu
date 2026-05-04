@@ -118,7 +118,7 @@ impl<S: Storable> Arena<S> {
     fn assert_invariant(&self) {
         unsafe { hint::assert_unchecked(self.0.len() >= S::INITIAL_VEC_LEN) }
     }
-    
+
     pub fn get(&self, handle: S::Handle) -> Option<&S> {
         self.assert_invariant();
         self.0.get(to_raw(handle).get())
@@ -136,7 +136,7 @@ impl<S: Storable> Arena<S> {
         let ref_mut = self.0.push_mut(item);
         (handle, ref_mut)
     }
-    
+
     pub fn store(&mut self, item: S) -> S::Handle {
         self.store_mut(item).0
     }

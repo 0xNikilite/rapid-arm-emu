@@ -3,6 +3,15 @@ use crate::ir::arena::make_handle;
 mod arena;
 
 
+// unsafe extern "C" fn(
+//     processor_state: &mut ProcessorState,
+//     pages: *const io_mmu::Page,
+//     page_count: u64,
+//     halt_reason: *const AtomicU32,
+//     io_mmu: *const IoMMU,
+// )
+
+
 make_handle!(Value);
 make_handle!(Stmt);
 
@@ -16,13 +25,19 @@ pub enum IntWidth {
 }
 
 impl IntWidth {
-    pub const fn bits(self) -> u8 {
-        self as u8 * 8
+    pub const fn bits(self) -> u32 {
+        self as u32 * 8
     }
 
     pub const fn bytes(self) -> usize {
         self as usize
     }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Type {
+    Int(IntWidth),
+    Ptr,
 }
 
 
@@ -124,12 +139,6 @@ pub struct BasicBlockParams {
     pub processor_state: Value,
     pub io_mmu: Value,
     pub halt_reason: Value,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Type {
-    Int(IntWidth),
-    Ptr(PointerKind),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

@@ -14,7 +14,7 @@
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use crossbeam_utils::CachePadded;
-use crate::mmu::HostPointer;
+use crate::io_mmu::HostPointer;
 use parking_lot::Mutex;
 
 

@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use crate::armv9::jit::CodeCache;
 use crate::halt_reason::{AtomicHaltReason, HaltReason, HaltReasonInner};
-use crate::mmu::IoMMU;
+use crate::io_mmu::IoMMU;
 
 pub(crate) mod jit;
 
