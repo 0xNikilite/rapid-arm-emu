@@ -1,4 +1,9 @@
-use crate::ir::arena::make_handle;
+use std::mem::offset_of;
+use std::sync::atomic::AtomicU32;
+use crate::armv9::{ProcessorState, X_REGISTER_COUNT};
+use crate::io_mmu;
+use crate::io_mmu::IoMMU;
+use crate::ir::arena::{impl_storable, Arena};
 
 mod arena;
 
@@ -196,11 +201,6 @@ impl ExecIrBuilder {
         }
     }
 
-    #[must_use]
-    fn make_lvalue(&mut self, ty: Type) -> LValue {
-        self.lvalues.store(LValueData { ty })
-    }
-
     fn type_of(&self, rvalue: &RValue) -> Type {
         match *rvalue {
             RValue::Iconst { width, .. } => Type::Int(width),
@@ -212,22 +212,37 @@ impl ExecIrBuilder {
             } => {
                 let lhs_ty = self.lvalues[lhs].ty;
                 let rhs_ty = self.lvalues[rhs].ty;
-                assert_eq!(lhs_ty, rhs_ty, "mismatched arithmetic type");
+
+                assert_eq!(lhs_ty, rhs_ty, "arithmetic type mismatch");
+
+                let Type::Int(w_found) = lhs_ty else {
+                    panic!("can only do arithmetic on integers");
+                };
+
+                assert_eq!(
+                    w_found,
+                    width,
+                    "expected arithmetic on {expected} found arithmetic on {found}",
+                    expected = width.bits(),
+                    found = w_found.bits()
+                );
+
                 lhs_ty
             },
-            RValue::LoadHost { .. } => {}
-            RValue::StoreHost { .. } => {}
-            RValue::LoadHaltReason(_) => {}
+            RValue::LoadHost { width, .. } => Type::Int(width),
+            RValue::StoreHost { .. } => Type::Unit,
+            RValue::LoadHaltReason(_) => Type::Int(IntWidth::W32),
         }
     }
 
-    #[must_use]
-    fn make_lvalue(&mut self, ty: Type) -> LValue {
-        self.lvalues.store(LValueData { ty })
-    }
     unsafe fn emit_stmt(&mut self, rvalue: RValue) -> LValue {
-
-}
+        let ty = self.type_of(&rvalue);
+        let (lvalue, reservation) = self.lvalues.reserve();
+        let current_block = &mut self.blocks[self.current_block];
+        let stmt = Stmt { lvalue, rvalue };
+        current_block.stmts.push(stmt);
+        reservation.store(LValueData { ty });
+        lvalue
     }
 
     unsafe fn load_x_reg_unchecked(&mut self, x_reg: u8, width: IntWidth) -> LValue {

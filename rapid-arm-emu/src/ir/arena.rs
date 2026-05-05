@@ -108,7 +108,7 @@ pub trait Storable: Sized {
 }
 
 
-pub struct Arena<S: Storable>(Vec<S>);
+pub struct Arena<S>(Vec<S>);
 
 
 impl<S: Storable> Arena<S> {
@@ -125,32 +125,59 @@ impl<S: Storable> Arena<S> {
         Self(vec)
     }
 
-    fn assert_invariant(&self) {
-        unsafe { hint::assert_unchecked(self.0.len() >= S::INITIAL_VEC_LEN) }
+    fn assert_invariants(&self) {
+        unsafe {
+            hint::assert_unchecked(self.0.len() >= S::INITIAL_VEC_LEN);
+            hint::assert_unchecked(self.0.len() <= int_to_usize(HandleInt::MAX));
+        }
     }
 
     pub fn get(&self, handle: S::Handle) -> Option<&S> {
-        self.assert_invariant();
+        self.assert_invariants();
         self.0.get(to_raw(handle).get())
     }
 
     pub fn get_mut(&mut self, handle: S::Handle) -> Option<&mut S> {
-        self.assert_invariant();
+        self.assert_invariants();
         self.0.get_mut(to_raw(handle).get())
     }
+}
 
-    pub fn store_mut(&mut self, item: S) -> (S::Handle, &mut S) {
-        self.assert_invariant();
+pub struct Reservation<'a, S>(&'a mut Arena<S>);
+
+impl<'a, S: Storable> Reservation<'a, S> {
+    fn try_reserve(arena: &'a mut Arena<S>) -> Option<Self> {
+        arena.assert_invariants();
+        arena.0.try_reserve(1).ok()?;
+        Some(Self(arena))
+    }
+    
+    pub fn store(self, item: S) -> &'a mut S {
+        unsafe { hint::assert_unchecked(self.0.0.len() < self.0.0.capacity()) }
+        self.0.0.push_mut(item)
+    }
+}
+
+impl<S: Storable> Arena<S> {
+    pub fn reserve(&mut self) -> (S::Handle, Reservation<S>) {
         let handle = RawHandle::new(self.0.len());
         let handle = from_raw::<S::Handle>(handle);
-        let ref_mut = self.0.push_mut(item);
-        (handle, ref_mut)
+        let reservation = Reservation::try_reserve(self)
+            .expect("TODO: OOM handling");
+        (handle, reservation)
+    }
+    
+    pub fn store_mut(&mut self, item: S) -> (S::Handle, &mut S) {
+        let (handle, reserve) = self.reserve();
+        (handle, reserve.store(item))
     }
 
     pub fn store(&mut self, item: S) -> S::Handle {
         self.store_mut(item).0
     }
 }
+
+
 
 #[cold]
 #[inline(never)]
