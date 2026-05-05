@@ -11,10 +11,12 @@ pub struct Vector(pub u128);
 
 const _: () = assert!(align_of::<Vector>() == 16 && size_of::<Vector>() == 16);
 
+pub(crate) const X_REGISTER_COUNT: u8 = 31;
+
 pub(crate) struct ProcessorState {
     pub(crate) sp: u64,
     pub(crate) pc: u64,
-    pub(crate) x_registers: [u64; 31],
+    pub(crate) x_registers: [u64; X_REGISTER_COUNT as usize],
     pub(crate) pstate: u32,
     pub(crate) fpsr: u32,
     pub(crate) fpcr: u32,
@@ -26,7 +28,7 @@ impl ProcessorState {
         Self {
             sp: 0,
             pc: 0,
-            x_registers: [0; 31],
+            x_registers: [0; X_REGISTER_COUNT as usize],
             pstate: 0,
             fpsr: 0,
             fpcr: 0,
