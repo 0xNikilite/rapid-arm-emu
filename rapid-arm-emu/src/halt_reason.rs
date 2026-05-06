@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Formatter};
+use std::mem::MaybeUninit;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -13,16 +14,50 @@ bitflags::bitflags! {
         const Step                = 0x00_00_00_01;
         const InvalidateInsnCache = 0x00_00_00_02;
         // the top 16 bits are for the trap's code
-        // and the last bit represents the trap type
-        const TrapBits            = 0xff_ff_0f_00;
+        // and the second byte represents the trap opcode
+        const TrapBits            = 0xFF_FF_FF_00;
+    }
+}
+
+impl HaltReasonInner {
+    fn merge_halt_reason(a: Self, b: Self) -> Self {
+        let internal_reasons = (a.bits() | b.bits()) & 0xFF;
+        let trap_mask = HaltReasonInner::TrapBits.bits();
+        let a_trap = a.bits() & trap_mask;
+        let b_trap = b.bits() & trap_mask;
+        let trap = std::hint::select_unpredictable(
+            a_trap != 0,
+            a_trap,
+            b_trap
+        );
+
+        Self::from_bits_retain(trap | internal_reasons)
     }
 }
 
 
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct HaltReason(NonZero<u32>);
+pub struct HaltReason {
+    pub opcode: NonZero<u8>,
+    pub payload: u16,
+}
+
+impl HaltReason {
+    pub(crate) fn from_inner(reason: HaltReasonInner) -> Option<Self> {
+        let bits = reason.bits();
+        let opcode = NonZero::new((bits >> 8) as u8)?;
+        let payload = (bits >> 16) as u16;
+        Some(Self {
+            opcode,
+            payload
+        })
+    }
+
+    pub(crate) fn into_inner(self) -> HaltReasonInner {
+        let bits = ((self.payload as u32) << 16) | ((self.opcode.get() as u32) << 8);
+        HaltReasonInner::from_bits_retain(bits)
+    }
+}
 
 impl Debug for HaltReason {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -50,19 +85,30 @@ impl AtomicHaltReason {
     }
 
     pub fn load(&self) -> HaltReasonInner {
-        HaltReasonInner::from_bits_retain(self.0.load(Ordering::SeqCst))
+        HaltReasonInner::from_bits_retain(self.0.load(Ordering::Acquire))
     }
 
-    pub fn add_reasons(&self, reason: HaltReasonInner) {
+    #[inline]
+    pub(crate) fn add_reasons_full(&self, reason: HaltReasonInner) {
         // CAS loop
         // the lsb gets `or`ed and the top 24 bits get replaced
-        let _ = reason;
-        todo!()
+        self.0.update(Ordering::Release, Ordering::Relaxed, |bits| {
+            let new_reason = HaltReasonInner::merge_halt_reason(
+                reason,
+                HaltReasonInner::from_bits_retain(bits)
+            );
+
+            new_reason.bits()
+        });
+    }
+
+    pub fn halt(&self, reason: HaltReason) {
+        self.add_reasons_full(reason.into_inner())
     }
     
     
     pub fn take(&self) -> HaltReasonInner {
-        HaltReasonInner::from_bits_retain(self.0.swap(0, Ordering::SeqCst))
+        HaltReasonInner::from_bits_retain(self.0.swap(0, Ordering::AcqRel))
     }
     
     pub(crate) fn as_ffi(&self) -> &AtomicU32 {

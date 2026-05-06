@@ -29,7 +29,7 @@ pub(crate) struct CompiledExecBlock {
     // Keeps the JIT module alive for at least as long as the fn pointer.
     //
     // If this is dropped while `ffi` may still be called, we get very very bad UB
-    _resources: Option<Arc<SyncCell<dyn Any + Send>>>,
+    _resources: Arc<SyncCell<dyn Any + Send>>,
 }
 
 impl CompiledExecBlock {
@@ -39,7 +39,7 @@ impl CompiledExecBlock {
     ) -> Self {
         Self {
             ffi,
-            _resources: Some(Arc::new(SyncCell::new(resources)))
+            _resources: Arc::new(SyncCell::new(resources))
         }
     }
 
@@ -67,9 +67,20 @@ impl CompiledExecBlock {
 
 // currently we only support cranelift but that should change soon with LLVM support
 
+enum CodegenBackend {
+
+}
+
+struct CompileOptions {
+    function_name: String,
+    show_disasm: bool,
+}
+
+
 pub struct ExecIrCompiler {
     next_function_id: AtomicUsize,
     cranelift_compiler: CraneliftCompiler,
+    show_disasm: bool,
 }
 
 impl ExecIrCompiler {
@@ -77,8 +88,9 @@ impl ExecIrCompiler {
         Self {
             next_function_id: AtomicUsize::new(0),
             cranelift_compiler: CraneliftCompiler::new(
-                cranelift_backend::OptLevel::Speed
+                cranelift_backend::OptLevel::SpeedAndSize
             ).unwrap(),
+            show_disasm: true
         }
     }
 
@@ -93,6 +105,11 @@ impl ExecIrCompiler {
             format!("exec_block_{id}")
         };
 
-        self.cranelift_compiler.try_compile(function_name, exec_ir)
+        let options = CompileOptions {
+            function_name,
+            show_disasm: self.show_disasm,
+        };
+        
+        self.cranelift_compiler.try_compile(options, exec_ir)
     }
 }

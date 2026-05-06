@@ -1,9 +1,12 @@
 use std::mem::offset_of;
-use crate::armv9::{ProcessorState, X_REGISTER_COUNT};
-use crate::ir::arena::{impl_storable, Arena, ArenaMap};
+use std::num::NonZero;
+use arrayvec::ArrayVec;
+use crate::armv9::{PState, ProcessorState, X_REGISTER_COUNT};
+use crate::array_helper;
+use crate::ir::arena::{impl_storable, Arena, ArenaSet};
 
 mod arena;
-mod compiler;
+pub(crate) mod compiler;
 
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -15,6 +18,16 @@ pub enum IntWidth {
 }
 
 impl IntWidth {
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        Some(match bits {
+            8 => Self::W8,
+            16 => Self::W16,
+            32 => Self::W32,
+            64 => Self::W64,
+            _ => return None
+        })
+    }
+
     pub const fn bits(self) -> u32 {
         (self as u32).strict_mul(8)
     }
@@ -25,17 +38,24 @@ impl IntWidth {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Type {
-    Unit,
+enum Type {
     Int(IntWidth),
+    Bool,
     HostPtr,
 }
 
-pub struct LValueData {
-    pub ty: Type,
+impl Type {
+    pub fn assert_int(self, op_name: &str) -> IntWidth {
+        let Type::Int(width) = self else {
+            panic!("can only do integer {op_name} on integers");
+        };
+        width
+    }
 }
 
-// Conceptual signature of every translated basic block:
+struct LValueData {
+    pub ty: Type,
+}
 
 impl_storable! {
     LValueData as impl pub LValue;
@@ -69,6 +89,89 @@ impl LValue {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct IConst {
+    width: IntWidth,
+    bits: u64,
+}
+
+impl IConst {
+    pub const fn width(self) -> IntWidth {
+        self.width
+    }
+
+    pub const fn zero(width: IntWidth) -> Self {
+        Self {
+            width,
+            bits: 0,
+        }
+    }
+
+    pub const fn one(width: IntWidth) -> Self {
+        Self {
+            width,
+            bits: 1,
+        }
+    }
+
+    pub const fn min_negative(width: IntWidth) -> Self {
+        match width {
+            IntWidth::W8 => const { Self::i8(i8::MIN) }
+            IntWidth::W16 => const { Self::i16(i16::MIN) }
+            IntWidth::W32 => const { Self::i32(i32::MIN) }
+            IntWidth::W64 => const { Self::i64(i64::MIN) }
+        }
+    }
+
+
+    pub const fn negative_one(width: IntWidth) -> Self {
+        let bits = width.bits();
+        assert!(bits <= 64);
+        Self {
+            width,
+            // its 2^n - 1 which encodes -1 in the given bit range
+            // except when n == 64 then its  0 - 1 which is still -1 ofr 64 bit integers
+            bits: 1_u64.unbounded_shl(bits).wrapping_sub(1)
+        }
+    }
+}
+
+macro_rules! zero_extend_u64 {
+    (u64, $value: expr) => { $value };
+    (i64, $value: expr) => { ($value).cast_unsigned() };
+
+
+    (u32, $value: expr) => { $value as u64 };
+    (u16, $value: expr) => { $value as u64 };
+    (u8, $value: expr) => { $value as u64 };
+
+    (i32, $value: expr) => { ($value).cast_unsigned() as u64 };
+    (i16, $value: expr) => { ($value).cast_unsigned() as u64 };
+    (i8, $value: expr) => { ($value).cast_unsigned() as u64 };
+}
+
+macro_rules! impl_primitive_constructors {
+    ($($int_ty: ident)+) => {
+        impl IConst {
+            $(
+            #[inline(always)]
+            pub const fn $int_ty(value: $int_ty) -> Self {
+                let width = const { IntWidth::from_bits($int_ty::BITS).unwrap() };
+                Self {
+                    width,
+                    bits: zero_extend_u64!($int_ty, value)
+                }
+            }
+            )+
+        }
+    };
+}
+
+impl_primitive_constructors! {
+    u64 u32 u16 u8
+    i64 i32 i16 i8
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ArithBinOp {
     /// Wrapping integer add.
@@ -81,62 +184,58 @@ pub enum ArithBinOp {
     Mul,
 
     /// Unsigned Integer division.
-    ///
-    /// This is a normal value-producing bin-op.
-    ///
-    /// It does not branch, does not panic, and does not terminate the block.
-    /// If `rhs == 0`, the result is `0`.
-    UDiv,
+    /// it is UB if `rhs == 0`
+    UncheckedUDiv,
 
     /// Signed integer division.
     ///
     /// This is a normal value-producing bin-op.
-    ///
-    /// It does not branch, does not panic, and does not terminate the block
-    /// and does not update condition flags.
-    /// The result is the signed quotient of `lhs / rhs`, rounded toward zero.
-    /// If `rhs == 0`, the result is `0`.
-    /// If the signed quotient is not representable, i.e. `INT_MIN / -1`,
-    /// the result is `INT_MIN`.
-    SDiv,
+    /// it is UB if `rhs == 0` OR `lhs == <ty>::MIN AND rhs == -1`
+    UncheckedSDiv,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum FlagSettingBinOp {
+pub enum OverflowingBinOp {
     Add,
     Sub,
 }
 
-#[derive(Debug, Copy, Clone)]
-pub enum IConst {
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64)
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum BitwiseOp {
+    And,
+    Or,
+    Xor,
 }
 
-impl IConst {
-    pub const fn width(self) -> IntWidth {
-        match self {
-            IConst::U8(_) => IntWidth::W8,
-            IConst::U16(_) => IntWidth::W16,
-            IConst::U32(_) => IntWidth::W32,
-            IConst::U64(_) => IntWidth::W64,
-        }
-    }
-
-    pub const fn zero(width: IntWidth) -> Self {
-        match width {
-            IntWidth::W8 => Self::U8(0),
-            IntWidth::W16 => Self::U16(0),
-            IntWidth::W32 => Self::U32(0),
-            IntWidth::W64 => Self::U64(0),
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum IntCmp {
+    /// `==`.
+    Equal,
+    /// `!=`.
+    NotEqual,
+    /// Signed `<`.
+    SignedLessThan,
+    /// Signed `>=`.
+    SignedGreaterThanOrEqual,
+    /// Signed `>`.
+    SignedGreaterThan,
+    /// Signed `<=`.
+    SignedLessThanOrEqual,
+    /// Unsigned `<`.
+    UnsignedLessThan,
+    /// Unsigned `>=`.
+    UnsignedGreaterThanOrEqual,
+    /// Unsigned `>`.
+    UnsignedGreaterThan,
+    /// Unsigned `<=`.
+    UnsignedLessThanOrEqual,
 }
+
+
+const MAX_STMT_OUTPUTS: usize = 2;
 
 #[derive(Debug, Clone)]
-pub enum RValue {
+enum StmtKind {
     /// Integer constant.
     IConst(IConst),
 
@@ -150,12 +249,46 @@ pub enum RValue {
         rhs: LValue,
     },
 
-    // resulting flags all go into ProcessorState, pstate and in the right posisitons
-    FlagSettingBinOp {
-        op: FlagSettingBinOp,
+    /// Produces:
+    ///   0: arithmetic result
+    ///   1: overflow flag
+    OverflowingBinOp {
+        op: OverflowingBinOp,
         lhs: LValue,
         rhs: LValue,
     },
+
+
+    IntCmp {
+        cmp: IntCmp,
+        lhs: LValue,
+        rhs: LValue,
+    },
+
+    IntCmpImm {
+        cmp: IntCmp,
+        lhs: LValue,
+        rhs: u64,
+    },
+
+    Select {
+        cond: LValue,
+        if_true: LValue,
+        if_false: LValue,
+    },
+
+    Bitwise {
+        op: BitwiseOp,
+        lhs: LValue,
+        rhs: LValue,
+    },
+
+    BitwiseImm {
+        op: BitwiseOp,
+        lhs: LValue,
+        rhs: u64,
+    },
+
 
     /// Load from a host pointer plus a constant byte offset.
     ///
@@ -184,14 +317,15 @@ pub enum RValue {
     InstructionDone,
 }
 
-
-pub struct Stmt {
-    pub lvalue: LValue,
-    pub rvalue: RValue,
+#[derive(Debug)]
+struct Stmt {
+    outputs: ArrayVec<LValue, MAX_STMT_OUTPUTS>,
+    rvalue: StmtKind,
 }
 
 
-pub enum Terminator {
+#[derive(Debug)]
+enum Terminator {
     /// Return "0" i.e. return success.
     Return,
     /// Return a `NonZero<u32>` block-exit reason.
@@ -206,10 +340,11 @@ pub enum Terminator {
     Br(Block),
 }
 
-pub struct BlockData {
-    pub stmts: Vec<Stmt>,
-    pub terminator: Terminator,
-    pub is_cold: bool,
+#[derive(Debug)]
+struct BlockData {
+    stmts: Vec<Stmt>,
+    terminator: Terminator,
+    is_cold: bool,
 }
 
 impl BlockData {
@@ -234,23 +369,35 @@ impl_storable!(
 pub(crate) struct ExecIr {
     lvalues: Arena<LValueData>,
     blocks: Arena<BlockData>,
+    block_compile_order: Vec<Block>,
 }
 
 pub(crate) struct ExecIrBuilder {
     lvalues: Arena<LValueData>,
     blocks: Arena<BlockData>,
     current_block: Block,
-    accurate_step: bool,
+    halt_check_every: NonZero<u32>,
+    halt_check_in: u32,
+}
+pub(crate) struct IrBuilderConfig {
+    halt_check_every: NonZero<u32>,
 }
 
+// FIXME reduce this massive code duplication
 impl ExecIrBuilder {
-    pub fn new() -> Self {
+    pub fn with_config(config: IrBuilderConfig) -> Self {
         Self {
             lvalues: Arena::new(),
             blocks: Arena::new(),
             current_block: Block::ENTRYPOINT,
-            accurate_step: false
+            halt_check_every: config.halt_check_every,
+            halt_check_in: config.halt_check_every.get()
         }
+    }
+
+    pub fn new() -> Self {
+        let halt_check_every = const { NonZero::new(512 + 256).unwrap() };
+        Self::with_config(IrBuilderConfig { halt_check_every })
     }
 
     pub fn current_block(&self) -> Block {
@@ -293,43 +440,92 @@ impl ExecIrBuilder {
         }
     }
 
-    fn type_of(&self, rvalue: &RValue) -> Type {
+    fn type_of(&self, rvalue: &StmtKind) -> arrayvec::IntoIter<Type, MAX_STMT_OUTPUTS> {
         match *rvalue {
-            RValue::IConst(iconst) => Type::Int(iconst.width()),
+            StmtKind::IConst(iconst) => {
+                array_helper::iter_from_arr([Type::Int(iconst.width())])
+            },
 
-            RValue::FlagSettingBinOp {
+
+            StmtKind::ArithBinOp { lhs, .. }
+            | StmtKind::Bitwise { lhs, .. }
+            | StmtKind::BitwiseImm { lhs, .. }
+            | StmtKind::Select { cond: _, if_true: lhs, if_false: _ } => {
+                array_helper::iter_from_arr([self.lvalues[lhs].ty])
+            },
+
+            StmtKind::OverflowingBinOp {
                 op: _,
                 lhs,
                 rhs: _,
-            } | RValue::ArithBinOp {
-                op: _,
-                lhs,
-                rhs: _
-            } => self.lvalues[lhs].ty,
+            } => array_helper::iter_from_arr([self.lvalues[lhs].ty, Type::Bool]),
 
-            RValue::LoadHost { width, .. } => Type::Int(width),
-            RValue::StoreHost { .. } => Type::Unit,
-            RValue::LoadHaltReason => Type::Int(IntWidth::W32),
-            RValue::InstructionDone => Type::Unit,
+            StmtKind::IntCmp { .. } | StmtKind::IntCmpImm { .. } => {
+                array_helper::iter_from_arr([Type::Bool])
+            },
+
+            StmtKind::LoadHost { width, .. } => {
+                array_helper::iter_from_arr([Type::Int(width)])
+            },
+
+            StmtKind::StoreHost { .. } => array_helper::empty(),
+            StmtKind::LoadHaltReason => array_helper::iter_from_arr([Type::Int(IntWidth::W32)]),
+            StmtKind::InstructionDone => array_helper::empty(),
         }
     }
 
-    unsafe fn emit_stmt(&mut self, rvalue: RValue) -> LValue {
-        let ty = self.type_of(&rvalue);
-        let current_block = &mut self.blocks[self.current_block];
-        let (lvalue, reservation) = self.lvalues.reserve();
-        let stmt = Stmt { lvalue, rvalue };
-        current_block.stmts.push(stmt);
-        reservation.store(LValueData { ty });
-        lvalue
+    /// # Safety
+    ///
+    /// the IR must not produce UB when run after compilation
+    unsafe fn emit_stmt_full<const N: usize>(&mut self, rvalue: StmtKind) -> [LValue; N] {
+        let outputs = self.type_of(&rvalue)
+            .map(|ty| self.lvalues.store(LValueData { ty }))
+            .collect::<ArrayVec<LValue, MAX_STMT_OUTPUTS>>();
+
+        let emit_out: &[LValue] = outputs.as_slice();
+        let emit_out: [LValue; N] = *emit_out.as_array()
+            .expect("invalid stmt output amount");
+
+        self.blocks[self.current_block].stmts.push(Stmt { outputs, rvalue });
+
+        emit_out
+    }
+
+
+    #[inline]
+    unsafe fn emit_void_stmt(&mut self, rvalue: StmtKind) {
+        let [] = unsafe { self.emit_stmt_full(rvalue) };
+    }
+
+    #[inline]
+    #[must_use]
+    unsafe fn emit_1ret_stmt(&mut self, rvalue: StmtKind) -> LValue {
+        let [value] = unsafe { self.emit_stmt_full(rvalue) };
+        value
+    }
+
+    #[inline]
+    #[must_use]
+    unsafe fn emit_2ret_stmt(&mut self, rvalue: StmtKind) -> (LValue, LValue) {
+        let [value1, value2] = unsafe { self.emit_stmt_full(rvalue) };
+        (value1, value2)
     }
 
     pub fn iconst(&mut self, iconst: IConst) -> LValue {
-        unsafe { self.emit_stmt(RValue::IConst(iconst)) }
+        unsafe { self.emit_1ret_stmt(StmtKind::IConst(iconst)) }
     }
 
+    unsafe fn load_from_processor_state(&mut self, offset: usize, width: IntWidth) -> LValue {
+        unsafe {
+            self.emit_1ret_stmt(StmtKind::LoadHost {
+                width,
+                base_ptr: LValue::ARG_PROCESSOR_STATE,
+                offset,
+            })
+        }
+    }
 
-    unsafe fn load_processor_register(&mut self, offset: usize, width: IntWidth) -> LValue {
+    unsafe fn load_from_64_bit_processor_register(&mut self, offset: usize, width: IntWidth) -> LValue {
         unsafe {
             // SAFETY: `offset` is assumed to be in-bounds for a full processor register
             // stored as a host `u64`. For sub-register loads, the byte offset must be
@@ -342,11 +538,7 @@ impl ExecIrBuilder {
                 target_endian = "big" => size_of::<u64>().strict_sub(width.bytes()),
             });
 
-            self.emit_stmt(RValue::LoadHost {
-                width,
-                base_ptr: LValue::ARG_PROCESSOR_STATE,
-                offset,
-            })
+            self.load_from_processor_state(offset, width)
         }
     }
 
@@ -361,34 +553,50 @@ impl ExecIrBuilder {
 
     pub fn load_x_reg_dyn(&mut self, x_reg: u8, width: IntWidth) -> LValue {
         assert!(x_reg < X_REGISTER_COUNT);
-        unsafe { self.load_processor_register(Self::x_reg_offset(x_reg), width) }
+        unsafe { self.load_from_64_bit_processor_register(Self::x_reg_offset(x_reg), width) }
     }
 
     pub fn load_x_reg<const REG_IDX: u8>(&mut self, width: IntWidth) -> LValue {
         const { assert!(REG_IDX < X_REGISTER_COUNT) }
-        unsafe { self.load_processor_register(Self::x_reg_offset(REG_IDX), width) }
+        unsafe { self.load_from_64_bit_processor_register(Self::x_reg_offset(REG_IDX), width) }
     }
 
+
     pub fn load_sp(&mut self) -> LValue {
-        unsafe { self.load_processor_register(offset_of!(ProcessorState, sp), IntWidth::W64) }
+        unsafe {
+            self.load_from_processor_state(offset_of!(ProcessorState, sp), IntWidth::W64)
+        }
     }
 
     pub fn load_pc(&mut self) -> LValue {
-        unsafe { self.load_processor_register(offset_of!(ProcessorState, pc), IntWidth::W64) }
+        unsafe {
+            self.load_from_processor_state(offset_of!(ProcessorState, pc), IntWidth::W64)
+        }
     }
+
+    pub fn load_pstate(&mut self) -> LValue {
+        unsafe {
+            self.load_from_processor_state(offset_of!(ProcessorState, pstate), IntWidth::W32)
+        }
+    }
+
+    unsafe fn store_to_processor_state(&mut self, offset: usize, value: LValue) {
+        unsafe {
+            self.emit_void_stmt(StmtKind::StoreHost {
+                base_ptr: LValue::ARG_PROCESSOR_STATE,
+                offset,
+                value
+            })
+        }
+    }
+
 
     unsafe fn store_processor_register(&mut self, offset: usize, value: LValue) {
         let Type::Int(IntWidth::W64) = self.lvalues[value].ty else {
             panic!("can only store 64 bit integers to processor registers")
         };
 
-        unsafe {
-            self.emit_stmt(RValue::StoreHost {
-                base_ptr: LValue::ARG_PROCESSOR_STATE,
-                offset,
-                value
-            });
-        }
+        unsafe { self.store_to_processor_state(offset, value) }
     }
 
     pub fn store_x_reg_dyn(&mut self, x_reg: u8, value: LValue) {
@@ -409,48 +617,250 @@ impl ExecIrBuilder {
         unsafe { self.store_processor_register(offset_of!(ProcessorState, pc), value) }
     }
 
-    fn emit_binop(
-        &mut self,
-        lhs: LValue,
-        rhs: LValue,
-        func: impl FnOnce(&mut Self, IntWidth) -> LValue
-    ) -> LValue {
-        let lhs_ty = self.lvalues[lhs].ty;
-        let rhs_ty = self.lvalues[rhs].ty;
-
-        let (Type::Int(width), Type::Int(width2)) = (lhs_ty, rhs_ty) else {
-            panic!("can only do arithmetic on integers");
+    pub fn store_pstate(&mut self, value: LValue) {
+        let Type::Int(IntWidth::W32) = self.lvalues[value].ty else {
+            panic!("can only store 32 bit integers to pstate")
         };
+
+        unsafe {
+            self.store_to_processor_state(
+                offset_of!(ProcessorState, pstate),
+                value
+            )
+        }
+    }
+
+    pub fn select(&mut self, cond: LValue, if_true: LValue, if_false: LValue) -> LValue {
+        assert_eq!(self.lvalues[cond].ty, Type::Bool, "condition must have bool type");
+        assert_eq!(self.lvalues[if_true].ty, self.lvalues[if_false].ty, "select type mismatch");
+        unsafe { self.emit_1ret_stmt(StmtKind::Select { cond, if_true, if_false }) }
+    }
+
+
+
+    fn emit_same_int_ty_imm<T>(
+        &mut self,
+        op_name: &'static str,
+        lhs: LValue,
+        rhs: IntWidth,
+        func: impl FnOnce(&mut Self) -> T
+    ) -> T {
+        let lhs_ty = self.lvalues[lhs].ty;
+        let width = lhs_ty.assert_int(op_name);
 
         assert_eq!(
             width,
-            width2,
+            rhs,
             "arithmetic size mismatch; lhs: {expected}, rhs: {found}",
             expected = width.bits(),
-            found = width2.bits()
+            found = rhs.bits()
         );
 
-        func(self, width)
+        func(self)
     }
+
+    fn emit_same_int_ty_binop<T>(
+        &mut self,
+        op_name: &'static str,
+        lhs: LValue,
+        rhs: LValue,
+        func: impl FnOnce(&mut Self, IntWidth) -> T
+    ) -> T {
+        let rhs = self.lvalues[rhs].ty.assert_int(op_name);
+        self.emit_same_int_ty_imm(
+            op_name,
+            lhs,
+            rhs,
+            |this| func(this, rhs)
+        )
+    }
+
+
+    pub fn icmp(
+        &mut self,
+        cmp: IntCmp,
+        lhs: LValue,
+        rhs: LValue,
+    ) -> LValue {
+        self.emit_same_int_ty_binop(
+            "comparisons",
+            lhs,
+            rhs,
+            |this, _width| unsafe {
+                this.emit_1ret_stmt(StmtKind::IntCmp {
+                    cmp,
+                    lhs,
+                    rhs,
+                })
+            }
+        )
+    }
+
+    pub fn icmp_imm(
+        &mut self,
+        cmp: IntCmp,
+        lhs: LValue,
+        rhs: IConst,
+    ) -> LValue {
+        self.emit_same_int_ty_imm(
+            "comparisons",
+            lhs,
+            rhs.width,
+            |this| unsafe {
+                this.emit_1ret_stmt(StmtKind::IntCmpImm {
+                    cmp,
+                    lhs,
+                    rhs: rhs.bits,
+                })
+            }
+        )
+    }
+
+    fn binop_type_guard<T>(
+        &mut self,
+        lhs: Type,
+        rhs: Type,
+        emit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        match (lhs, rhs) {
+            (Type::Bool, Type::Bool) => emit(self),
+            (Type::Int(width1), Type::Int(width2)) => match width1 == width2 {
+                true => emit(self),
+                false => panic!("mismatched integer widths used for bitwise op")
+            },
+
+            (Type::HostPtr, Type::HostPtr) => {
+                panic!("can't do pointer bitwise operations currently")
+            },
+
+            _ => panic!("mismatched types used for bitwise operation")
+        }
+    }
+
+
+    fn emit_binop(&mut self, op: BitwiseOp, lhs: LValue, rhs: LValue) -> LValue {
+        let lhs_ty = self.lvalues[lhs].ty;
+        let rhs_ty = self.lvalues[rhs].ty;
+        self.binop_type_guard(lhs_ty, rhs_ty, |this| unsafe {
+            this.emit_1ret_stmt(StmtKind::Bitwise { op, lhs, rhs })
+        })
+    }
+
+    fn emit_binop_imm(&mut self, op: BitwiseOp, lhs: LValue, rhs: IConst) -> LValue {
+        let lhs_ty = self.lvalues[lhs].ty;
+        self.binop_type_guard(lhs_ty, Type::Int(rhs.width), |this| unsafe {
+            this.emit_1ret_stmt(StmtKind::BitwiseImm { op, lhs, rhs: rhs.bits })
+        })
+    }
+
+    pub fn bitor(&mut self, lhs: LValue, rhs: LValue) -> LValue {
+        self.emit_binop(BitwiseOp::Or, lhs, rhs)
+    }
+
+    pub fn bitand(&mut self, lhs: LValue, rhs: LValue) -> LValue {
+        self.emit_binop(BitwiseOp::And, lhs, rhs)
+    }
+
+    pub fn bitxor(&mut self, lhs: LValue, rhs: LValue) -> LValue {
+        self.emit_binop(BitwiseOp::Xor, lhs, rhs)
+    }
+
+    pub fn bitor_imm(&mut self, lhs: LValue, rhs: IConst) -> LValue {
+        self.emit_binop_imm(BitwiseOp::Or, lhs, rhs)
+    }
+
+    pub fn bitand_imm(&mut self, lhs: LValue, rhs: IConst) -> LValue {
+        self.emit_binop_imm(BitwiseOp::And, lhs, rhs)
+    }
+
+    pub fn bitxor_imm(&mut self, lhs: LValue, rhs: IConst) -> LValue {
+        self.emit_binop_imm(BitwiseOp::Xor, lhs, rhs)
+    }
+
+    pub fn set_nzcv_flags(
+        &mut self,
+        n: LValue,
+        z: LValue,
+        c: LValue,
+        v: LValue,
+    ) {
+        let old_flags = self.load_pstate();
+
+        let zeroed = self.iconst(IConst::u32(0));
+
+        let n_flag_true = self.iconst(IConst::u32(PState::N.0));
+        let z_flag_true = self.iconst(IConst::u32(PState::Z.0));
+        let c_flag_true = self.iconst(IConst::u32(PState::C.0));
+        let v_flag_true = self.iconst(IConst::u32(PState::V.0));
+
+        let n_flag = self.select(n, n_flag_true, zeroed);
+        let z_flag = self.select(z, z_flag_true, zeroed);
+        let c_flag = self.select(c, c_flag_true, zeroed);
+        let v_flag = self.select(v, v_flag_true, zeroed);
+
+        let nz_flag = self.bitor(n_flag, z_flag);
+        let cv_flag = self.bitor(c_flag, v_flag);
+        let nzcv_flags = self.bitor(nz_flag, cv_flag);
+
+        let masked_out_flags = self.bitand_imm(old_flags, IConst::u32(!PState::NZCV_MASK.0));
+        let new_flags = self.bitor(masked_out_flags, nzcv_flags);
+
+        self.store_pstate(new_flags);
+    }
+
 
     fn emit_arith_binop(&mut self, op: ArithBinOp, lhs: LValue, rhs: LValue) -> LValue {
-        self.emit_binop(lhs, rhs, move |this, _width| unsafe {
-            this.emit_stmt(RValue::ArithBinOp {
-                op,
-                lhs,
-                rhs,
-            })
-        })
+        self.emit_same_int_ty_binop(
+            "arithmetic",
+            lhs,
+            rhs,
+            move |this, _width| unsafe {
+                this.emit_1ret_stmt(StmtKind::ArithBinOp {
+                    op,
+                    lhs,
+                    rhs,
+                })
+            }
+        )
     }
 
-    fn emit_flag_setting_binop(&mut self, op: FlagSettingBinOp, lhs: LValue, rhs: LValue) -> LValue {
-        self.emit_binop(lhs, rhs, move |this, _width| unsafe {
-            this.emit_stmt(RValue::FlagSettingBinOp {
-                op,
+    fn emit_flag_setting_binop(
+        &mut self,
+        op: OverflowingBinOp,
+        lhs: LValue,
+        rhs: LValue
+    ) -> LValue {
+        let (value, overflow, width) = {
+            self.emit_same_int_ty_binop(
+                "overflowing arithmetic",
                 lhs,
                 rhs,
-            })
-        })
+                move |this, width| {
+                    let (value, overflow) = unsafe {
+                        this.emit_2ret_stmt(StmtKind::OverflowingBinOp {
+                            op,
+                            lhs,
+                            rhs,
+                        })
+                    };
+
+                    (value, overflow, width)
+                }
+            )
+        };
+
+        let zero_imm = IConst::zero(width);
+
+        let negative = self.icmp_imm(IntCmp::SignedLessThan, value, zero_imm);
+        let zero = self.icmp_imm(IntCmp::Equal, value, zero_imm);
+        let carry = match op {
+            OverflowingBinOp::Add => self.icmp(IntCmp::UnsignedLessThan, value, lhs),
+            OverflowingBinOp::Sub => self.icmp(IntCmp::UnsignedGreaterThanOrEqual, lhs, rhs),
+        };
+
+        self.set_nzcv_flags(negative, zero, carry, overflow);
+
+        value
     }
 
     pub fn add(&mut self, lhs: LValue, rhs: LValue) -> LValue {
@@ -465,12 +875,86 @@ impl ExecIrBuilder {
         self.emit_arith_binop(ArithBinOp::Mul, lhs, rhs)
     }
 
+    /// This is a normal value-producing bin-op.
+    ///
+    /// It does not branch, does not panic, and does not terminate the block.
+    /// If `rhs == 0`, the result is `0`.
     pub fn udiv(&mut self, lhs: LValue, rhs: LValue) -> LValue {
-        self.emit_arith_binop(ArithBinOp::UDiv, lhs, rhs)
+        self.emit_same_int_ty_binop(
+            "division",
+            lhs,
+            rhs,
+            move |this, width| {
+                let zero_imm = IConst::zero(width);
+
+                let zero = this.iconst(zero_imm);
+                let one = this.iconst(IConst::one(width));
+
+                let rhs_is_zero = this.icmp_imm(IntCmp::Equal, rhs, zero_imm);
+
+                // `select` is not lazy, so make the divisor safe before dividing.
+                let safe_rhs = this.select(rhs_is_zero, one, rhs);
+
+                let quotient = unsafe {
+                    this.emit_1ret_stmt(StmtKind::ArithBinOp {
+                        op: ArithBinOp::UncheckedUDiv,
+                        lhs,
+                        rhs: safe_rhs,
+                    })
+                };
+
+                this.select(rhs_is_zero, zero, quotient)
+            }
+        )
     }
 
+    /// It does not branch, does not panic, and does not terminate the block
+    /// and does not update condition flags.
+    /// The result is the signed quotient of `lhs / rhs`, rounded toward zero.
+    /// If `rhs == 0`, the result is `0`.
+    /// If the signed quotient is not representable, i.e. `INT_MIN / -1`,
+    /// the result is `INT_MIN`.
     pub fn sdiv(&mut self, lhs: LValue, rhs: LValue) -> LValue {
-        self.emit_arith_binop(ArithBinOp::SDiv, lhs, rhs)
+        self.emit_same_int_ty_binop(
+            "division",
+            lhs,
+            rhs,
+            move |this, width| {
+                let zero_imm = IConst::zero(width);
+                let int_min_imm = IConst::min_negative(width);
+                let negative_one_imm = IConst::negative_one(width);
+
+                let zero = this.iconst(zero_imm);
+                let one = this.iconst(IConst::one(width));
+
+                let rhs_is_zero = this.icmp_imm(IntCmp::Equal, rhs, zero_imm);
+                let lhs_is_min = this.icmp_imm(IntCmp::Equal, lhs, int_min_imm);
+                let rhs_is_minus_one = this.icmp_imm(IntCmp::Equal, rhs, negative_one_imm);
+
+                let is_overflow = this.bitand(lhs_is_min, rhs_is_minus_one);
+
+                // Avoid both UB cases:
+                //   rhs == 0
+                //   lhs == INT_MIN && rhs == -1
+                let use_safe_rhs = this.bitor(rhs_is_zero, is_overflow);
+
+                // INT_MIN / -1 should produce INT_MIN.
+                // Since safe_rhs is 1 in the overflow case, quotient is already lhs,
+                // but this makes the intended semantics explicit.
+                let safe_rhs = this.select(use_safe_rhs, one, rhs);
+
+                let quotient = unsafe {
+                    this.emit_1ret_stmt(StmtKind::ArithBinOp {
+                        op: ArithBinOp::UncheckedSDiv,
+                        lhs,
+                        rhs: safe_rhs,
+                    })
+                };
+
+                // rhs == 0 should produce 0.
+                this.select(rhs_is_zero, zero, quotient)
+            }
+        )
     }
 
 
@@ -487,11 +971,11 @@ impl ExecIrBuilder {
 
 
     pub fn adds(&mut self, lhs: LValue, rhs: LValue) -> LValue {
-        self.emit_flag_setting_binop(FlagSettingBinOp::Add, lhs, rhs)
+        self.emit_flag_setting_binop(OverflowingBinOp::Add, lhs, rhs)
     }
 
     pub fn subs(&mut self, lhs: LValue, rhs: LValue) -> LValue {
-        self.emit_flag_setting_binop(FlagSettingBinOp::Sub, lhs, rhs)
+        self.emit_flag_setting_binop(OverflowingBinOp::Sub, lhs, rhs)
     }
 
     fn insert_halt_check_at(
@@ -506,7 +990,7 @@ impl ExecIrBuilder {
             if let Some(instruction_end) = insert_at.checked_sub(1) {
                 assert!(matches!(
                     block_data.stmts[instruction_end].rvalue,
-                    RValue::InstructionDone
+                    StmtKind::InstructionDone
                 ));
             }
 
@@ -537,8 +1021,8 @@ impl ExecIrBuilder {
         let block_data = &mut self.blocks[block];
 
         block_data.stmts.push(Stmt {
-            lvalue: halt_reason,
-            rvalue: RValue::LoadHaltReason,
+            outputs: array_helper::from_arr([halt_reason]),
+            rvalue: StmtKind::LoadHaltReason,
         });
 
         block_data.terminator = Terminator::BrNZ {
@@ -552,109 +1036,131 @@ impl ExecIrBuilder {
 
     pub fn instruction_done(&mut self) {
         unsafe {
-            self.emit_stmt(RValue::InstructionDone);
-            if self.accurate_step {
-                // insert at the end, aka just after the instruction ends
+            self.emit_void_stmt(StmtKind::InstructionDone);
+
+            self.halt_check_in = self.halt_check_in.strict_sub(1);
+            if self.halt_check_in == 0 {
+                self.halt_check_in = self.halt_check_every.get();
                 self.current_block = self.insert_halt_check_at(
                     self.current_block,
-                    |data| data.stmts.len()
-                )
+                    |block| block.stmts.len()
+                );
             }
         }
     }
+}
 
-    fn terminator_targets(terminator: &Terminator) -> impl DoubleEndedIterator<Item=Block> {
-        match *terminator {
-            Terminator::Br(target) => {
-                // Keep every match arm returning the same concrete iterator type.
-                // This avoids boxing/dynamic dispatch while still letting callers treat this as
-                // "zero, one, or two targets".
-                let mut iter = [Block::ENTRYPOINT, target].into_iter();
 
-                // Discard the sentinel so the real target is yielded from slot 1.
-                // The sentinel value is never observed by callers.
-                iter.next();
+fn terminator_targets(terminator: &Terminator) -> arrayvec::IntoIter<Block, 2> {
+    match *terminator {
+        Terminator::Br(target) => array_helper::iter_from_arr([target]),
 
-                iter
-            },
 
-            Terminator::Return | Terminator::ReturnFail { .. } => {
-                let mut iter = [Block::ENTRYPOINT, Block::ENTRYPOINT].into_iter();
-                iter.next();
-                iter.next();
+        Terminator::Return | Terminator::ReturnFail { .. } => array_helper::empty(),
 
-                iter
-            }
+        Terminator::BrNZ {
+            non_zero,
+            zero,
+            ..
+        } => array_helper::iter_from_arr([non_zero, zero]),
+    }
+}
 
-            Terminator::BrNZ {
-                non_zero,
-                zero,
-                ..
-            } => [non_zero, zero].into_iter(),
-        }
+
+fn compute_reverse_post_order(exec_ir: &ExecIrBuilder) -> Vec<Block> {
+    #[derive(Debug, Copy, Clone)]
+    enum DfsFrame {
+        Enter(Block),
+        Exit(Block),
     }
 
-    fn collect_backedge_sources(&self) -> Vec<Block> {
-        use std::collections::HashSet;
+    let mut seen = ArenaSet::with_capacity(exec_ir.blocks.len());
 
-        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-        enum DfsState {
-            InStack,
-            Done,
-        }
+    let mut postorder = Vec::with_capacity(exec_ir.blocks.len());
 
-        let mut state: ArenaMap<Block, DfsState> = ArenaMap::with_capacity(self.blocks.len());
-        let mut already_emitted: HashSet<Block> = HashSet::new();
-        let mut out = Vec::new();
+    let mut dfs_stack = vec![DfsFrame::Enter(Block::ENTRYPOINT)];
 
-        // `(block, iter)`.
-        let mut stack = Vec::new();
+    while let Some(frame) = dfs_stack.pop() {
+        match frame {
+            DfsFrame::Enter(block) => {
+                if !seen.insert(block) {
+                    continue;
+                }
 
-        state.insert(Block::ENTRYPOINT, DfsState::InStack);
-        stack.push((
-            Block::ENTRYPOINT,
-            Self::terminator_targets(&self.blocks[Block::ENTRYPOINT].terminator)
-        ));
+                dfs_stack.push(DfsFrame::Exit(block));
 
-        while !stack.is_empty() {
-            let (source, target) = {
-                let &mut (block, ref mut next_target_idx) = stack
-                    .last_mut()
-                    .expect("checked non-empty stack above");
+                let block_terminator = &exec_ir.blocks[block].terminator;
 
-                (block, next_target_idx.next())
-            };
-
-            let Some(target) = target else {
-                let (finished, _) = stack.pop().unwrap();
-                state.insert(finished, DfsState::Done);
-                continue;
-            };
-
-            match state.get(target).copied() {
-                Some(DfsState::InStack) => {
-                    // `source -> target` points to an ancestor in the DFS stack.
-                    // That is a DFS backedge, so guard the source block.
-                    if already_emitted.insert(source) {
-                        out.push(source);
+                for target in terminator_targets(block_terminator).rev() {
+                    if !seen.contains(target) {
+                        dfs_stack.push(DfsFrame::Enter(target));
                     }
                 }
+            }
 
-                Some(DfsState::Done) => { /* Already fully explored */ }
-
-                None => {
-                    state.insert(target, DfsState::InStack);
-                    stack.push((
-                        target,
-                        Self::terminator_targets(&self.blocks[target].terminator)
-                    ));
-                }
+            DfsFrame::Exit(block) => {
+                assert!(postorder.len() < exec_ir.blocks.len());
+                postorder.push(block);
             }
         }
-
-        out
     }
 
+    assert!(postorder.len() <= exec_ir.blocks.len());
+
+    postorder.reverse();
+    postorder
+}
+
+
+fn compute_backedge_sources(exec_ir: &ExecIrBuilder) -> Vec<Block> {
+    #[derive(Debug, Copy, Clone)]
+    enum DfsFrame {
+        Enter(Block),
+        Exit(Block),
+    }
+
+    let mut seen = ArenaSet::with_capacity(exec_ir.blocks.len());
+    let mut active = ArenaSet::with_capacity(exec_ir.blocks.len());
+
+    let mut backedge_source_set = ArenaSet::with_capacity(exec_ir.blocks.len());
+    let mut backedge_sources = Vec::new();
+
+    let mut dfs_stack = vec![DfsFrame::Enter(Block::ENTRYPOINT)];
+
+    while let Some(frame) = dfs_stack.pop() {
+        match frame {
+            DfsFrame::Enter(block) => {
+                if !seen.insert(block) {
+                    continue;
+                }
+
+                active.insert(block);
+                dfs_stack.push(DfsFrame::Exit(block));
+
+                let block_terminator = &exec_ir.blocks[block].terminator;
+
+                for target in terminator_targets(block_terminator) {
+                    if active.contains(target) {
+                        if backedge_source_set.insert(block) {
+                            backedge_sources.push(block);
+                        }
+                    } else if !seen.contains(target) {
+                        dfs_stack.push(DfsFrame::Enter(target));
+                    }
+                }
+            }
+
+            DfsFrame::Exit(block) => {
+                active.remove(block);
+            }
+        }
+    }
+
+    backedge_sources
+}
+
+
+impl ExecIrBuilder {
     fn insert_halt_check_guard(&mut self, block: Block) {
         // place the halt poll after instruction completion.
         // That preserves the invariant that a translated instruction either fully retires
@@ -663,29 +1169,23 @@ impl ExecIrBuilder {
             block_data
                 .stmts
                 .iter()
-                .rposition(|stmt| matches!(stmt.rvalue, RValue::InstructionDone))
+                .rposition(|stmt| matches!(stmt.rvalue, StmtKind::InstructionDone))
                 .map_or(0, |idx| idx.strict_add(1))
         });
     }
 
     pub fn build(mut self) -> ExecIr {
-        if !self.accurate_step {
-            // TODO: only check every N instructions or so
-            //       that also means adding in halt checks
-            //       and that means simplifying
-            //       the accurate_step to be just when N = 0
-            //       that also has a speedup effect since it
-            //       means we don't poll for halt every single
-            //       step of a hot small loop
-            for block in self.collect_backedge_sources() {
+        if self.halt_check_every != const { NonZero::new(1).unwrap() } {
+            for block in compute_backedge_sources(&self) {
                 self.insert_halt_check_guard(block);
             }
         }
 
-
+        let reverse_post_order = compute_reverse_post_order(&self);
         ExecIr {
             lvalues: self.lvalues,
             blocks: self.blocks,
+            block_compile_order: reverse_post_order
         }
     }
 }
@@ -729,7 +1229,7 @@ mod exec_ir_tests {
     }
 
     fn u64_const(builder: &mut ExecIrBuilder, value: u64) -> LValue {
-        builder.iconst(IConst::U64(value))
+        builder.iconst(IConst::u64(value))
     }
 
     fn store_x_const<const REG_IDX: u8>(
@@ -853,7 +1353,7 @@ mod exec_ir_tests {
         let bad = builder.create_block();
 
         let got8 = builder.load_x_reg::<0>(IntWidth::W8);
-        let expected8 = builder.iconst(IConst::U8(0x88));
+        let expected8 = builder.iconst(IConst::u8(0x88));
         let diff8 = builder.sub(got8, expected8);
         let check16 = builder.create_block();
 
@@ -865,7 +1365,7 @@ mod exec_ir_tests {
 
         builder.switch_to(check16);
         let got16 = builder.load_x_reg::<0>(IntWidth::W16);
-        let expected16 = builder.iconst(IConst::U16(0x7788));
+        let expected16 = builder.iconst(IConst::u16(0x7788));
         let diff16 = builder.sub(got16, expected16);
         let check32 = builder.create_block();
 
@@ -877,7 +1377,7 @@ mod exec_ir_tests {
 
         builder.switch_to(check32);
         let got32 = builder.load_x_reg::<0>(IntWidth::W32);
-        let expected32 = builder.iconst(IConst::U32(0x5566_7788));
+        let expected32 = builder.iconst(IConst::u32(0x5566_7788));
         let diff32 = builder.sub(got32, expected32);
         let good = builder.create_block();
 
@@ -1288,8 +1788,8 @@ mod exec_ir_tests {
     fn builder_rejects_arithmetic_width_mismatch() {
         let mut builder = ExecIrBuilder::new();
 
-        let wide = builder.iconst(IConst::U64(1));
-        let narrow = builder.iconst(IConst::U32(1));
+        let wide = builder.iconst(IConst::u64(1));
+        let narrow = builder.iconst(IConst::u32(1));
 
         let _ = builder.add(wide, narrow);
     }
@@ -1299,7 +1799,7 @@ mod exec_ir_tests {
     fn builder_rejects_storing_narrow_value_to_processor_register() {
         let mut builder = ExecIrBuilder::new();
 
-        let narrow = builder.iconst(IConst::U32(1));
+        let narrow = builder.iconst(IConst::u32(1));
         builder.store_x_reg::<0>(narrow);
     }
 
@@ -1318,5 +1818,640 @@ mod exec_ir_tests {
 
         let value = u64_const(&mut builder, 1);
         builder.store_x_reg_dyn(X_REGISTER_COUNT, value);
+    }
+
+
+    fn store_bool_as_x_reg<const REG_IDX: u8>(
+        builder: &mut ExecIrBuilder,
+        cond: LValue,
+    ) {
+        let one = builder.iconst(IConst::u64(1));
+        let zero = builder.iconst(IConst::u64(0));
+        let value = builder.select(cond, one, zero);
+        builder.store_x_reg::<REG_IDX>(value);
+    }
+
+    fn store_int_equals_as_x_reg<const REG_IDX: u8>(
+        builder: &mut ExecIrBuilder,
+        value: LValue,
+        expected: IConst,
+    ) {
+        let ok = builder.icmp_imm(IntCmp::Equal, value, expected);
+        store_bool_as_x_reg::<REG_IDX>(builder, ok);
+    }
+
+    fn clear_pstate(builder: &mut ExecIrBuilder) {
+        let zero = builder.iconst(IConst::u32(0));
+        builder.store_pstate(zero);
+    }
+
+    fn store_pstate_equals_as_x_reg<const REG_IDX: u8>(
+        builder: &mut ExecIrBuilder,
+        expected: u32,
+    ) {
+        let pstate = builder.load_pstate();
+        let ok = builder.icmp_imm(IntCmp::Equal, pstate, IConst::u32(expected));
+        store_bool_as_x_reg::<REG_IDX>(builder, ok);
+    }
+
+    #[test]
+    fn int_width_metadata_is_exact() {
+        assert_eq!(IntWidth::from_bits(8), Some(IntWidth::W8));
+        assert_eq!(IntWidth::from_bits(16), Some(IntWidth::W16));
+        assert_eq!(IntWidth::from_bits(32), Some(IntWidth::W32));
+        assert_eq!(IntWidth::from_bits(64), Some(IntWidth::W64));
+
+        assert_eq!(IntWidth::from_bits(0), None);
+        assert_eq!(IntWidth::from_bits(1), None);
+        assert_eq!(IntWidth::from_bits(7), None);
+        assert_eq!(IntWidth::from_bits(128), None);
+
+        assert_eq!(IntWidth::W8.bits(), 8);
+        assert_eq!(IntWidth::W16.bits(), 16);
+        assert_eq!(IntWidth::W32.bits(), 32);
+        assert_eq!(IntWidth::W64.bits(), 64);
+
+        assert_eq!(IntWidth::W8.bytes(), 1);
+        assert_eq!(IntWidth::W16.bytes(), 2);
+        assert_eq!(IntWidth::W32.bytes(), 4);
+        assert_eq!(IntWidth::W64.bytes(), 8);
+    }
+
+    #[test]
+    fn integer_comparisons_cover_signed_unsigned_and_immediates() {
+        let mut builder = ExecIrBuilder::new();
+
+        let minus_one = builder.iconst(IConst::i64(-1));
+        let plus_one = builder.iconst(IConst::u64(1));
+
+        let cond = builder.icmp(IntCmp::Equal, minus_one, plus_one);
+        store_bool_as_x_reg::<0>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::NotEqual, minus_one, plus_one);
+        store_bool_as_x_reg::<1>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::SignedLessThan, minus_one, plus_one);
+        store_bool_as_x_reg::<2>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::SignedGreaterThanOrEqual, minus_one, plus_one);
+        store_bool_as_x_reg::<3>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::SignedGreaterThan, minus_one, plus_one);
+        store_bool_as_x_reg::<4>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::SignedLessThanOrEqual, minus_one, plus_one);
+        store_bool_as_x_reg::<5>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::UnsignedLessThan, minus_one, plus_one);
+        store_bool_as_x_reg::<6>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::UnsignedGreaterThanOrEqual, minus_one, plus_one);
+        store_bool_as_x_reg::<7>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::UnsignedGreaterThan, minus_one, plus_one);
+        store_bool_as_x_reg::<8>(&mut builder, cond);
+
+        let cond = builder.icmp(IntCmp::UnsignedLessThanOrEqual, minus_one, plus_one);
+        store_bool_as_x_reg::<9>(&mut builder, cond);
+
+        let cond = builder.icmp_imm(IntCmp::SignedLessThan, minus_one, IConst::u64(1));
+        store_bool_as_x_reg::<10>(&mut builder, cond);
+
+        let cond = builder.icmp_imm(IntCmp::UnsignedGreaterThan, minus_one, IConst::u64(1));
+        store_bool_as_x_reg::<11>(&mut builder, cond);
+
+        let cond = builder.icmp_imm(IntCmp::Equal, minus_one, IConst::i64(-1));
+        store_bool_as_x_reg::<12>(&mut builder, cond);
+
+        let mut state = ProcessorState::initial();
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[0], 0);
+        assert_eq!(state.x_registers[1], 1);
+        assert_eq!(state.x_registers[2], 1);
+        assert_eq!(state.x_registers[3], 0);
+        assert_eq!(state.x_registers[4], 0);
+        assert_eq!(state.x_registers[5], 1);
+        assert_eq!(state.x_registers[6], 0);
+        assert_eq!(state.x_registers[7], 1);
+        assert_eq!(state.x_registers[8], 1);
+        assert_eq!(state.x_registers[9], 0);
+        assert_eq!(state.x_registers[10], 1);
+        assert_eq!(state.x_registers[11], 1);
+        assert_eq!(state.x_registers[12], 1);
+    }
+
+    #[test]
+    fn select_handles_both_paths_and_bool_values() {
+        let mut builder = ExecIrBuilder::new();
+
+        let x0 = builder.load_x_reg::<0>(IntWidth::W64);
+        let cond = builder.icmp_imm(IntCmp::NotEqual, x0, IConst::u64(0));
+
+        let true_value = builder.iconst(IConst::u64(0xaaaa));
+        let false_value = builder.iconst(IConst::u64(0xbbbb));
+        let selected = builder.select(cond, true_value, false_value);
+        builder.store_x_reg::<1>(selected);
+
+        let one = builder.iconst(IConst::u64(1));
+        let zero = builder.iconst(IConst::u64(0));
+        let true_bool = builder.icmp(IntCmp::NotEqual, one, zero);
+        let false_bool = builder.icmp(IntCmp::Equal, one, zero);
+        let selected_bool = builder.select(cond, true_bool, false_bool);
+        store_bool_as_x_reg::<2>(&mut builder, selected_bool);
+
+        let compiled = compile(builder);
+
+        let mut zero_state = ProcessorState::initial();
+        zero_state.x_registers[0] = 0;
+        assert_eq!(call_compiled(&compiled, &mut zero_state), 0);
+        assert_eq!(zero_state.x_registers[1], 0xbbbb);
+        assert_eq!(zero_state.x_registers[2], 0);
+
+        let mut non_zero_state = ProcessorState::initial();
+        non_zero_state.x_registers[0] = 1;
+        assert_eq!(call_compiled(&compiled, &mut non_zero_state), 0);
+        assert_eq!(non_zero_state.x_registers[1], 0xaaaa);
+        assert_eq!(non_zero_state.x_registers[2], 1);
+    }
+
+    #[test]
+    fn bitwise_integer_and_bool_ops_cover_reg_and_immediate_forms() {
+        let mut builder = ExecIrBuilder::new();
+
+        let a = builder.iconst(IConst::u64(0xca));
+        let b = builder.iconst(IConst::u64(0xac));
+
+        let value = builder.bitand(a, b);
+        builder.store_x_reg::<0>(value);
+
+        let value = builder.bitor(a, b);
+        builder.store_x_reg::<1>(value);
+
+        let value = builder.bitxor(a, b);
+        builder.store_x_reg::<2>(value);
+
+        let value = builder.bitand_imm(a, IConst::u64(0xf0));
+        builder.store_x_reg::<3>(value);
+
+        let value = builder.bitor_imm(b, IConst::u64(0x03));
+        builder.store_x_reg::<4>(value);
+
+        let value = builder.bitxor_imm(a, IConst::u64(0xff));
+        builder.store_x_reg::<5>(value);
+
+        let one = builder.iconst(IConst::u64(1));
+        let zero = builder.iconst(IConst::u64(0));
+        let true_bool = builder.icmp(IntCmp::NotEqual, one, zero);
+        let false_bool = builder.icmp(IntCmp::Equal, one, zero);
+
+        let value = builder.bitand(true_bool, false_bool);
+        store_bool_as_x_reg::<6>(&mut builder, value);
+
+        let value = builder.bitor(true_bool, false_bool);
+        store_bool_as_x_reg::<7>(&mut builder, value);
+
+        let value = builder.bitxor(true_bool, false_bool);
+        store_bool_as_x_reg::<8>(&mut builder, value);
+
+        let mut state = ProcessorState::initial();
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[0], 0x88);
+        assert_eq!(state.x_registers[1], 0xee);
+        assert_eq!(state.x_registers[2], 0x66);
+        assert_eq!(state.x_registers[3], 0xc0);
+        assert_eq!(state.x_registers[4], 0xaf);
+        assert_eq!(state.x_registers[5], 0x35);
+        assert_eq!(state.x_registers[6], 0);
+        assert_eq!(state.x_registers[7], 1);
+        assert_eq!(state.x_registers[8], 1);
+    }
+
+    #[test]
+    fn narrow_integer_ops_wrap_compare_and_divide_correctly() {
+        let mut builder = ExecIrBuilder::new();
+
+        let lhs = builder.iconst(IConst::u8(250));
+        let rhs = builder.iconst(IConst::u8(10));
+        let value = builder.add(lhs, rhs);
+        store_int_equals_as_x_reg::<0>(&mut builder, value, IConst::u8(4));
+
+        let lhs = builder.iconst(IConst::u16(0));
+        let rhs = builder.iconst(IConst::u16(1));
+        let value = builder.sub(lhs, rhs);
+        store_int_equals_as_x_reg::<1>(&mut builder, value, IConst::u16(u16::MAX));
+
+        let lhs = builder.iconst(IConst::u32(0x8000_0000));
+        let rhs = builder.iconst(IConst::u32(2));
+        let value = builder.mul(lhs, rhs);
+        store_int_equals_as_x_reg::<2>(&mut builder, value, IConst::u32(0));
+
+        let lhs = builder.iconst(IConst::u8(250));
+        let rhs = builder.iconst(IConst::u8(10));
+        let value = builder.udiv(lhs, rhs);
+        store_int_equals_as_x_reg::<3>(&mut builder, value, IConst::u8(25));
+
+        let lhs = builder.iconst(IConst::u8(250));
+        let rhs = builder.iconst(IConst::u8(0));
+        let value = builder.udiv(lhs, rhs);
+        store_int_equals_as_x_reg::<4>(&mut builder, value, IConst::u8(0));
+
+        let lhs = builder.iconst(IConst::i16(-9));
+        let rhs = builder.iconst(IConst::i16(2));
+        let value = builder.sdiv(lhs, rhs);
+        store_int_equals_as_x_reg::<5>(&mut builder, value, IConst::i16(-4));
+
+        let lhs = builder.iconst(IConst::i16(i16::MIN));
+        let rhs = builder.iconst(IConst::i16(-1));
+        let value = builder.sdiv(lhs, rhs);
+        store_int_equals_as_x_reg::<6>(&mut builder, value, IConst::i16(i16::MIN));
+
+        let value = builder.iconst(IConst::u8(1));
+        let value = builder.neg(value);
+        store_int_equals_as_x_reg::<7>(&mut builder, value, IConst::u8(255));
+
+        let value = builder.iconst(IConst::u16(0x00ff));
+        let value = builder.bitxor_imm(value, IConst::u16(0x0ff0));
+        store_int_equals_as_x_reg::<8>(&mut builder, value, IConst::u16(0x0f0f));
+
+        let mut state = ProcessorState::initial();
+        run_success(builder, &mut state);
+
+        for idx in 0..=8 {
+            assert_eq!(state.x_registers[idx], 1, "x{idx}");
+        }
+    }
+
+    #[test]
+    fn signed_and_unsigned_division_cover_more_rounding_edges() {
+        let mut builder = ExecIrBuilder::new();
+
+        let lhs = builder.iconst(IConst::i64(7));
+        let rhs = builder.iconst(IConst::i64(-2));
+        let value = builder.sdiv(lhs, rhs);
+        builder.store_x_reg::<0>(value);
+
+        let lhs = builder.iconst(IConst::i64(-7));
+        let rhs = builder.iconst(IConst::i64(-2));
+        let value = builder.sdiv(lhs, rhs);
+        builder.store_x_reg::<1>(value);
+
+        let lhs = builder.iconst(IConst::u64(u64::MAX));
+        let rhs = builder.iconst(IConst::u64(u64::MAX));
+        let value = builder.udiv(lhs, rhs);
+        builder.store_x_reg::<2>(value);
+
+        let lhs = builder.iconst(IConst::u64(7));
+        let rhs = builder.iconst(IConst::u64(8));
+        let value = builder.udiv(lhs, rhs);
+        builder.store_x_reg::<3>(value);
+
+        let mut state = ProcessorState::initial();
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[0], (-3_i64).cast_unsigned());
+        assert_eq!(state.x_registers[1], 3);
+        assert_eq!(state.x_registers[2], 1);
+        assert_eq!(state.x_registers[3], 0);
+    }
+
+    #[test]
+    fn dynamic_narrow_register_loads_read_low_order_bits() {
+        let mut builder = ExecIrBuilder::new();
+
+        let got = builder.load_x_reg_dyn(0, IntWidth::W8);
+        store_int_equals_as_x_reg::<1>(&mut builder, got, IConst::u8(0xef));
+
+        let got = builder.load_x_reg_dyn(0, IntWidth::W16);
+        store_int_equals_as_x_reg::<2>(&mut builder, got, IConst::u16(0xcdef));
+
+        let got = builder.load_x_reg_dyn(0, IntWidth::W32);
+        store_int_equals_as_x_reg::<3>(&mut builder, got, IConst::u32(0x89ab_cdef));
+
+        let mut state = ProcessorState::initial();
+        state.x_registers[0] = 0x0123_4567_89ab_cdef;
+
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[1], 1);
+        assert_eq!(state.x_registers[2], 1);
+        assert_eq!(state.x_registers[3], 1);
+    }
+
+    #[test]
+    fn set_nzcv_flags_preserves_non_flag_bits_and_replaces_old_flags() {
+        let mut builder = ExecIrBuilder::new();
+
+        let preserved = 0x00ff_00ff & !PState::NZCV_MASK.0;
+        let initial = preserved | PState::NZCV_MASK.0;
+
+        let initial = builder.iconst(IConst::u32(initial));
+        builder.store_pstate(initial);
+
+        let one = builder.iconst(IConst::u64(1));
+        let zero = builder.iconst(IConst::u64(0));
+
+        let true_bool = builder.icmp(IntCmp::NotEqual, one, zero);
+        let false_bool = builder.icmp(IntCmp::Equal, one, zero);
+
+        builder.set_nzcv_flags(
+            true_bool,
+            false_bool,
+            true_bool,
+            false_bool,
+        );
+
+        let expected = preserved | PState::N.0 | PState::C.0;
+        store_pstate_equals_as_x_reg::<0>(&mut builder, expected);
+
+        let mut state = ProcessorState::initial();
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[0], 1);
+    }
+
+    #[test]
+    fn adds_and_subs_set_arm_nzcv_flags_for_wrap_carry_and_overflow() {
+        let mut builder = ExecIrBuilder::new();
+
+        clear_pstate(&mut builder);
+        let lhs = builder.iconst(IConst::u64(u64::MAX));
+        let rhs = builder.iconst(IConst::u64(1));
+        let value = builder.adds(lhs, rhs);
+        builder.store_x_reg::<0>(value);
+        store_pstate_equals_as_x_reg::<1>(&mut builder, PState::Z.0 | PState::C.0);
+
+        clear_pstate(&mut builder);
+        let lhs = builder.iconst(IConst::i64(i64::MAX));
+        let rhs = builder.iconst(IConst::i64(1));
+        let value = builder.adds(lhs, rhs);
+        builder.store_x_reg::<2>(value);
+        store_pstate_equals_as_x_reg::<3>(&mut builder, PState::N.0 | PState::V.0);
+
+        clear_pstate(&mut builder);
+        let lhs = builder.iconst(IConst::u64(0));
+        let rhs = builder.iconst(IConst::u64(1));
+        let value = builder.subs(lhs, rhs);
+        builder.store_x_reg::<4>(value);
+        store_pstate_equals_as_x_reg::<5>(&mut builder, PState::N.0);
+
+        clear_pstate(&mut builder);
+        let lhs = builder.iconst(IConst::i64(i64::MIN));
+        let rhs = builder.iconst(IConst::i64(1));
+        let value = builder.subs(lhs, rhs);
+        builder.store_x_reg::<6>(value);
+        store_pstate_equals_as_x_reg::<7>(&mut builder, PState::C.0 | PState::V.0);
+
+        let mut state = ProcessorState::initial();
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[0], 0);
+        assert_eq!(state.x_registers[1], 1);
+
+        assert_eq!(state.x_registers[2], i64::MIN.cast_unsigned());
+        assert_eq!(state.x_registers[3], 1);
+
+        assert_eq!(state.x_registers[4], u64::MAX);
+        assert_eq!(state.x_registers[5], 1);
+
+        assert_eq!(state.x_registers[6], i64::MAX.cast_unsigned());
+        assert_eq!(state.x_registers[7], 1);
+    }
+
+    #[test]
+    fn return_fail_returns_halt_reason_and_preserves_prior_stores() {
+        let mut builder = ExecIrBuilder::new();
+
+        store_x_const::<0>(&mut builder, 0x1234);
+
+        let halt_reason = builder.iconst(IConst::u32(0x4d2));
+        builder.terminate(Terminator::ReturnFail { halt_reason });
+
+        let mut state = ProcessorState::initial();
+        assert_eq!(run(builder, &mut state), 0x4d2);
+        assert_eq!(state.x_registers[0], 0x1234);
+    }
+
+    #[test]
+    fn branch_to_return_fail_only_fails_on_taken_path() {
+        let mut builder = ExecIrBuilder::new();
+
+        let fail = builder.create_block();
+        let ok = builder.create_block();
+
+        let cond = builder.load_x_reg::<0>(IntWidth::W64);
+        builder.terminate(Terminator::BrNZ {
+            cond,
+            non_zero: fail,
+            zero: ok,
+        });
+
+        builder.switch_to(fail);
+        let halt_reason = builder.iconst(IConst::u32(0xbeef));
+        builder.terminate(Terminator::ReturnFail { halt_reason });
+
+        builder.switch_to(ok);
+        store_x_const::<1>(&mut builder, 0x600d);
+
+        let compiled = compile(builder);
+
+        let mut fail_state = ProcessorState::initial();
+        fail_state.x_registers[0] = 1;
+        assert_eq!(call_compiled(&compiled, &mut fail_state), 0xbeef);
+        assert_eq!(fail_state.x_registers[1], 0);
+
+        let mut ok_state = ProcessorState::initial();
+        ok_state.x_registers[0] = 0;
+        assert_eq!(call_compiled(&compiled, &mut ok_state), 0);
+        assert_eq!(ok_state.x_registers[1], 0x600d);
+    }
+
+    #[test]
+    fn unreachable_blocks_do_not_execute() {
+        let mut builder = ExecIrBuilder::new();
+
+        let unreachable = builder.create_block();
+
+        builder.switch_to(unreachable);
+        store_x_const::<0>(&mut builder, 0xbad);
+
+        builder.switch_to(Block::ENTRYPOINT);
+        store_x_const::<0>(&mut builder, 0x600d);
+
+        let mut state = ProcessorState::initial();
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[0], 0x600d);
+    }
+
+    #[test]
+    fn explicit_halt_check_every_instruction_still_retires_all_instructions() {
+        let mut builder = ExecIrBuilder::with_config(IrBuilderConfig {
+            halt_check_every: NonZero::new(1).unwrap()
+        });
+
+        builder.instruction_done();
+        builder.instruction_done();
+        builder.instruction_done();
+        builder.instruction_done();
+
+        let mut state = ProcessorState::initial();
+        state.pc = 0x40;
+
+        run_success(builder, &mut state);
+
+        assert_eq!(state.pc, 0x50);
+    }
+
+    #[test]
+    fn automatic_halt_check_split_at_default_interval_preserves_pc_progress() {
+        let mut builder = ExecIrBuilder::new();
+
+        for _ in 0..520 {
+            builder.instruction_done();
+        }
+
+        let mut state = ProcessorState::initial();
+        state.pc = 0x1000;
+
+        run_success(builder, &mut state);
+
+        assert_eq!(state.pc, 0x1000 + 520_u64 * 4);
+    }
+
+    #[test]
+    fn backedge_halt_guard_after_instruction_done_preserves_loop_retirement() {
+        let mut builder = ExecIrBuilder::new();
+
+        let loop_block = builder.create_block();
+        let exit_block = builder.create_block();
+
+        builder.terminate(Terminator::Br(loop_block));
+
+        builder.switch_to(loop_block);
+        let current = builder.load_x_reg::<0>(IntWidth::W64);
+        let one = builder.iconst(IConst::u64(1));
+        let next = builder.sub(current, one);
+        builder.store_x_reg::<0>(next);
+        builder.instruction_done();
+        builder.terminate(Terminator::BrNZ {
+            cond: next,
+            non_zero: loop_block,
+            zero: exit_block,
+        });
+
+        builder.switch_to(exit_block);
+        store_x_const::<1>(&mut builder, 0x5151);
+
+        let mut state = ProcessorState::initial();
+        state.x_registers[0] = 5;
+        state.pc = 0x1000;
+
+        run_success(builder, &mut state);
+
+        assert_eq!(state.x_registers[0], 0);
+        assert_eq!(state.x_registers[1], 0x5151);
+        assert_eq!(state.pc, 0x1000 + 5 * 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "condition must have bool type")]
+    fn builder_rejects_select_with_integer_condition() {
+        let mut builder = ExecIrBuilder::new();
+
+        let cond = builder.iconst(IConst::u64(1));
+        let if_true = builder.iconst(IConst::u64(2));
+        let if_false = builder.iconst(IConst::u64(3));
+
+        let _ = builder.select(cond, if_true, if_false);
+    }
+
+    #[test]
+    #[should_panic(expected = "select type mismatch")]
+    fn builder_rejects_select_value_type_mismatch() {
+        let mut builder = ExecIrBuilder::new();
+
+        let one = builder.iconst(IConst::u64(1));
+        let cond = builder.icmp_imm(IntCmp::Equal, one, IConst::u64(1));
+
+        let if_true = builder.iconst(IConst::u64(2));
+        let if_false = builder.iconst(IConst::u32(3));
+
+        let _ = builder.select(cond, if_true, if_false);
+    }
+
+    #[test]
+    #[should_panic(expected = "arithmetic size mismatch")]
+    fn builder_rejects_comparison_width_mismatch() {
+        let mut builder = ExecIrBuilder::new();
+
+        let wide = builder.iconst(IConst::u64(1));
+        let _ = builder.icmp_imm(IntCmp::Equal, wide, IConst::u32(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "mismatched integer widths used for bitwise op")]
+    fn builder_rejects_bitwise_width_mismatch() {
+        let mut builder = ExecIrBuilder::new();
+
+        let wide = builder.iconst(IConst::u64(1));
+        let narrow = builder.iconst(IConst::u32(1));
+
+        let _ = builder.bitor(wide, narrow);
+    }
+
+    #[test]
+    #[should_panic(expected = "mismatched integer widths used for bitwise op")]
+    fn builder_rejects_bitwise_imm_width_mismatch() {
+        let mut builder = ExecIrBuilder::new();
+
+        let wide = builder.iconst(IConst::u64(1));
+
+        let _ = builder.bitand_imm(wide, IConst::u32(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "can't do pointer bitwise operations currently")]
+    fn builder_rejects_pointer_bitwise_operations() {
+        let mut builder = ExecIrBuilder::new();
+
+        let _ = builder.bitor(LValue::ARG_PROCESSOR_STATE, LValue::ARG_PAGES);
+    }
+
+    #[test]
+    #[should_panic]
+    fn terminator_rejects_bool_branch_condition() {
+        let mut builder = ExecIrBuilder::new();
+
+        let one = builder.iconst(IConst::u64(1));
+        let cond = builder.icmp_imm(IntCmp::Equal, one, IConst::u64(1));
+        let target = builder.create_block();
+
+        builder.terminate(Terminator::BrNZ {
+            cond,
+            non_zero: target,
+            zero: target,
+        });
+    }
+
+    #[test]
+    #[should_panic]
+    fn terminator_rejects_bool_return_fail_reason() {
+        let mut builder = ExecIrBuilder::new();
+
+        let one = builder.iconst(IConst::u64(1));
+        let halt_reason = builder.icmp_imm(IntCmp::Equal, one, IConst::u64(1));
+
+        builder.terminate(Terminator::ReturnFail { halt_reason });
+    }
+
+    #[test]
+    #[should_panic(expected = "can only store 32 bit integers to pstate")]
+    fn builder_rejects_storing_non_w32_to_pstate() {
+        let mut builder = ExecIrBuilder::new();
+
+        let wide = builder.iconst(IConst::u64(0));
+        builder.store_pstate(wide);
     }
 }

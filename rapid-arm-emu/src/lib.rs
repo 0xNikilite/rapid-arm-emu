@@ -16,6 +16,7 @@
 // FIXME; remove generic VAddr, there is no a64 and a32 CPU, there is just a an Armv9-A CPU
 //        which also happens to have 2 execution states; AArch32 and AArch64
 
+mod array_helper;
 mod ir;
 mod a64;
 pub mod cpu_fabric;

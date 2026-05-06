@@ -1,22 +1,17 @@
 use rayon::iter::ParallelIterator;
 use std::collections::{HashMap, HashSet};
-use std::collections::hash_map::Entry;
 use std::ffi::OsStr;
 use std::fmt::Debug;
-use std::fs::File;
-use std::io;
 use std::io::{BufRead, Read};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
 use compact_str::CompactString;
-use eyre::{bail, ensure, ContextCompat, Result};
-use rayon::iter::IntoParallelIterator;
+use eyre::{bail, ensure, Result};
 use tempfile::TempDir;
 use crate::instruction_parser::isa::{Isa, IsaEnum, A64};
-use crate::instruction_parser::system_register::{SystemRegister, SystemRegisters};
-use crate::instruction_parser::tar_ball::TarFileEntry;
+use crate::instruction_parser::system_register::SystemRegisters;
 use crate::interner::{Interner, Symbol};
 
 mod tar_ball;
@@ -160,7 +155,7 @@ impl<Arch: Isa> InstructionSet<Arch> {
 
 
 fn load_instruction_files_from_archive<Arch: Isa>(
-    tempdir: &TempDir,
+    _tempdir: &TempDir,
     interner: &Interner,
 ) -> Result<Vec<Instruction<Arch>>> {
     let arch_name = Arch::NAME;

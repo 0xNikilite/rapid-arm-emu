@@ -1,65 +1,17 @@
-use std::collections::HashSet;
 use std::mem::{offset_of, ManuallyDrop};
 use anyhow::{anyhow, bail, ensure, Context};
+use arrayvec::ArrayVec;
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{Linkage, Module};
 use crate::ir::arena::ArenaMap;
-use crate::ir::{ArithBinOp, ExecIr, ExecIrBuilder, FlagSettingBinOp, IConst, IntWidth, LValue, RValue, Stmt, Terminator};
+use crate::ir::{ArithBinOp, ExecIr, OverflowingBinOp, IConst, IntWidth, LValue, StmtKind, Stmt, Terminator, IntCmp, BitwiseOp, MAX_STMT_OUTPUTS};
 use crate::ir::{Block as IrBlock, Type as IrType};
 use cranelift::codegen::ir as clif_ir;
 use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlags};
-use cranelift::prelude::isa::{CallConv, OwnedTargetIsa};
-use crate::armv9::{PState, ProcessorState};
-use crate::ir::compiler::{CompiledExecBlock, ExecBlockFFI};
-
-// does 2 jobs:
-// 1. do it in reverse post order, i.e. topo sort
-// 2. dead code elimination (very minimal)
-fn reverse_post_order_exec_ir(exec_ir: &ExecIr) -> Vec<IrBlock> {
-    #[derive(Debug, Copy, Clone)]
-    enum DfsFrame {
-        Enter(IrBlock),
-        Exit(IrBlock),
-    }
-
-    let mut seen = HashSet::new();
-    let mut postorder = Vec::with_capacity(exec_ir.blocks.len());
-
-    let mut dfs_stack = vec![DfsFrame::Enter(IrBlock::ENTRYPOINT)];
-
-    while let Some(frame) = dfs_stack.pop() {
-        match frame {
-            DfsFrame::Enter(block) => {
-                if !seen.insert(block) {
-                    continue;
-                }
-
-                dfs_stack.push(DfsFrame::Exit(block));
-
-                let block_terminator = &exec_ir.blocks[block].terminator;
-
-                // Stack is LIFO, so reverse the target order when pushing.
-                //
-                // If terminator_targets yields [non_zero, zero], this preserves
-                // recursive DFS behavior: non_zero is visited before zero.
-                for target in ExecIrBuilder::terminator_targets(block_terminator).rev() {
-                    dfs_stack.push(DfsFrame::Enter(target));
-                }
-            }
-
-            DfsFrame::Exit(block) => {
-                assert!(postorder.len() < exec_ir.blocks.len());
-                postorder.push(block);
-            }
-        }
-    }
-
-    assert!(postorder.len() <= exec_ir.blocks.len());
-
-    postorder.reverse();
-    postorder
-}
+use cranelift::prelude::isa::OwnedTargetIsa;
+use crate::armv9::ProcessorState;
+use crate::ir::compiler::{CompileOptions, CompiledExecBlock, ExecBlockFFI};
 
 struct FunctionLowering<'a> {
     builder: FunctionBuilder<'a>,
@@ -69,73 +21,6 @@ struct FunctionLowering<'a> {
     values: ArenaMap<LValue, clif_ir::Value>,
     blocks: ArenaMap<IrBlock, clif_ir::Block>,
 }
-
-fn int_min_imm(ty: clif_ir::Type) -> i64 {
-    let bits = ty.bits();
-    assert!(ty.is_int());
-    assert!(bits <= 64, "this helper handles scalar ints up to i64");
-
-    match bits {
-        64 => i64::MIN,
-        _ => 1_i64.strict_shl(bits.strict_sub(1)).strict_neg()
-    }
-}
-
-fn emit_udiv(
-    builder: &mut FunctionBuilder<'_>,
-    lhs: clif_ir::Value,
-    rhs: clif_ir::Value
-) -> clif_ir::Value {
-    let ty = builder.func.dfg.value_type(lhs);
-
-    let zero = builder.ins().iconst(ty, 0);
-    let one = builder.ins().iconst(ty, 1);
-
-    let rhs_is_zero = builder.ins().icmp_imm(IntCC::Equal, rhs, 0);
-
-    // `select` is not lazy, so make the divisor safe before dividing.
-    let safe_rhs = builder.ins().select(rhs_is_zero, one, rhs);
-
-    let quotient = builder.ins().udiv(lhs, safe_rhs);
-
-    // rhs == 0 produces 0.
-    builder.ins().select(rhs_is_zero, zero, quotient)
-}
-
-fn emit_sdiv(
-    builder: &mut FunctionBuilder<'_>,
-    lhs: clif_ir::Value,
-    rhs: clif_ir::Value,
-) ->  clif_ir::Value {
-    let ty = builder.func.dfg.value_type(lhs);
-
-    let zero = builder.ins().iconst(ty, 0);
-    let one = builder.ins().iconst(ty, 1);
-    let int_min = builder.ins().iconst(ty, int_min_imm(ty));
-
-    let rhs_is_zero = builder.ins().icmp_imm(IntCC::Equal, rhs, 0);
-
-    let lhs_is_min = builder.ins().icmp(IntCC::Equal, lhs, int_min);
-    let rhs_is_minus_one = builder.ins().icmp_imm(IntCC::Equal, rhs, -1);
-    let is_overflow = builder.ins().band(lhs_is_min, rhs_is_minus_one);
-
-    // Avoid both Cranelift trap cases:
-    //   rhs == 0
-    //   lhs == INT_MIN && rhs == -1
-    let safe_rhs_for_zero = builder.ins().select(rhs_is_zero, one, rhs);
-    let safe_rhs = builder.ins().select(is_overflow, one, safe_rhs_for_zero);
-
-    let quotient = builder.ins().sdiv(lhs, safe_rhs);
-
-    // INT_MIN / -1 should produce INT_MIN.
-    // Since safe_rhs is 1 in the overflow case, quotient is already lhs,
-    // but this makes the intended semantics explicit.
-    let quotient = builder.ins().select(is_overflow, lhs, quotient);
-
-    // rhs == 0 should produce 0.
-    builder.ins().select(rhs_is_zero, zero, quotient)
-}
-
 
 impl<'a> FunctionLowering<'a> {
     fn bind_entry_args(&mut self, entry_block: clif_ir::Block) -> anyhow::Result<()> {
@@ -164,13 +49,12 @@ impl<'a> FunctionLowering<'a> {
 
     fn new(
         mut builder: FunctionBuilder<'a>,
-        exec_ir: &ExecIr,
-        live_ordered_blocks: &'a [IrBlock],
+        exec_ir: &'a ExecIr,
         ptr_ty: clif_ir::Type,
     ) -> anyhow::Result<Self> {
         let mut blocks = ArenaMap::with_capacity(exec_ir.blocks.len());
 
-        for &ir_block in live_ordered_blocks {
+        for &ir_block in &exec_ir.block_compile_order {
             let clif_block = builder.create_block();
 
             if exec_ir.blocks[ir_block].is_cold {
@@ -189,7 +73,7 @@ impl<'a> FunctionLowering<'a> {
         let mut this = Self {
             builder,
             ptr_ty,
-            live_ordered_blocks,
+            live_ordered_blocks: &exec_ir.block_compile_order,
             values: ArenaMap::with_capacity(exec_ir.lvalues.len()),
             blocks,
         };
@@ -197,6 +81,22 @@ impl<'a> FunctionLowering<'a> {
         this.bind_entry_args(entry_block)?;
 
         Ok(this)
+    }
+
+    fn use_value(&self, lvalue: LValue) -> anyhow::Result<clif_ir::Value> {
+        self.values
+            .get(lvalue)
+            .copied()
+            .context("internal compiler error: lvalue used before being lowered")
+    }
+
+    fn clif_block(&self, block: IrBlock) -> anyhow::Result<clif_ir::Block> {
+        let res = self.blocks
+            .get(block)
+            .copied()
+            .expect("internal compiler error: missing cranelift block");
+
+        Ok(res)
     }
 
 
@@ -210,12 +110,9 @@ impl<'a> FunctionLowering<'a> {
     }
 
     fn iconst(&mut self, iconst: IConst) -> clif_ir::Value {
-        match iconst {
-            IConst::U8(value) => self.builder.ins().iconst(clif_ir::types::I8, value as i64),
-            IConst::U16(value) => self.builder.ins().iconst(clif_ir::types::I16, value as i64),
-            IConst::U32(value) => self.builder.ins().iconst(clif_ir::types::I32, value as i64),
-            IConst::U64(value) => self.builder.ins().iconst(clif_ir::types::I64, value.cast_signed()),
-        }
+        let bits = iconst.bits.cast_signed();
+        let ty = Self::int_ty(iconst.width);
+        self.builder.ins().iconst(ty, bits)
     }
 
 
@@ -235,25 +132,20 @@ impl<'a> FunctionLowering<'a> {
     }
 
 
-    fn lower_stmt(&mut self, exec_ir: &ExecIr, stmt: &Stmt) -> anyhow::Result<()> {
-        let dst_ty = exec_ir.lvalues[stmt.lvalue].ty;
+    fn lower_stmt(&mut self, _exec_ir: &ExecIr, stmt: &Stmt) -> anyhow::Result<()> {
+        let values = self.lower_rvalue(&stmt.rvalue)?;
+        let outputs = stmt.outputs.as_slice();
 
-        let value = self.lower_rvalue(exec_ir, stmt.lvalue, dst_ty, &stmt.rvalue)?;
+        ensure!(
+            outputs.len() == values.len(),
+            "statement lowering produced mismatched values"
+        );
 
-        match (dst_ty, value) {
-            (IrType::Unit, None) => Ok(()),
-
-            (IrType::Unit, Some(_)) => bail!(
-                "statement lowering produced a value for a unit-typed lvalue"
-            ),
-
-            (_, Some(value)) => {
-                self.values.insert(stmt.lvalue, value);
-                Ok(())
-            }
-
-            (_, None) => bail!("statement lowering produced no value for a non-unit lvalue"),
+        for (value, &lvalue) in values.into_iter().zip(outputs) {
+            self.values.insert(lvalue, value);
         }
+
+        Ok(())
     }
 
     fn host_memory_flags() -> MemFlags {
@@ -266,7 +158,7 @@ impl<'a> FunctionLowering<'a> {
         base_ptr: LValue,
         offset: usize
     ) -> anyhow::Result<clif_ir::Value> {
-        let base_ptr = self.values[base_ptr];
+        let base_ptr = self.use_value(base_ptr)?;
         let offset = i32::try_from(offset)
             .context("internal compiler error host load offset too large")?;
 
@@ -284,7 +176,7 @@ impl<'a> FunctionLowering<'a> {
         offset: usize,
         value: clif_ir::Value
     ) -> anyhow::Result<()> {
-        let base_ptr = self.values[base_ptr];
+        let base_ptr = self.use_value(base_ptr)?;
 
         let offset = i32::try_from(offset)
             .context("internal compiler error host load offset too large")?;
@@ -299,129 +191,135 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-    fn lower_set_nzcv_flag_set(
-        &mut self,
-        n: clif_ir::Value,
-        z: clif_ir::Value,
-        c: clif_ir::Value,
-        v: clif_ir::Value,
-    ) -> anyhow::Result<()> {
-        let base_ptr = LValue::ARG_PROCESSOR_STATE;
-        let offset = offset_of!(ProcessorState, pstate);
-
-        let old_flags = self.lower_host_load(IntWidth::W32, base_ptr, offset)?;
-
-        let mut u32_const =
-            |x: u32| self.builder.ins().iconst(clif_ir::types::I32, i64::from(x));
-
-        let zeroed = u32_const(0);
-
-        let n_flag_true = u32_const(PState::N.0);
-        let z_flag_true = u32_const(PState::Z.0);
-        let c_flag_true = u32_const(PState::C.0);
-        let v_flag_true = u32_const(PState::V.0);
-
-        let n_flag = self.builder.ins().select(n, n_flag_true, zeroed);
-        let z_flag = self.builder.ins().select(z, z_flag_true, zeroed);
-        let c_flag = self.builder.ins().select(c, c_flag_true, zeroed);
-        let v_flag = self.builder.ins().select(v, v_flag_true, zeroed);
-
-        let nz_flag = self.builder.ins().bor(n_flag, z_flag);
-        let cv_flag = self.builder.ins().bor(c_flag, v_flag);
-        let nzcv_flags = self.builder.ins().bor(nz_flag, cv_flag);
-
-        let masked_out_flags = self.builder.ins().band_imm(old_flags, i64::from(!PState::NZCV_MASK.0));
-        let new_flags = self.builder.ins().bor(masked_out_flags, nzcv_flags);
-
-        self.lower_host_store(base_ptr, offset, new_flags)?;
-
-        Ok(())
+    fn convert_to_intcc(cmp: IntCmp) -> IntCC {
+        match cmp {
+            IntCmp::Equal => IntCC::Equal,
+            IntCmp::NotEqual => IntCC::NotEqual,
+            IntCmp::SignedLessThan => IntCC::SignedLessThan,
+            IntCmp::SignedGreaterThanOrEqual => IntCC::SignedGreaterThanOrEqual,
+            IntCmp::SignedGreaterThan => IntCC::SignedGreaterThan,
+            IntCmp::SignedLessThanOrEqual => IntCC::SignedLessThanOrEqual,
+            IntCmp::UnsignedLessThan => IntCC::UnsignedLessThan,
+            IntCmp::UnsignedGreaterThanOrEqual => IntCC::UnsignedGreaterThanOrEqual,
+            IntCmp::UnsignedGreaterThan => IntCC::UnsignedGreaterThan,
+            IntCmp::UnsignedLessThanOrEqual => IntCC::UnsignedLessThanOrEqual,
+        }
     }
 
     fn lower_rvalue(
         &mut self,
-        _exec_ir: &ExecIr,
-        _dst: LValue,
-        _dst_ty: IrType,
-        rvalue: &RValue,
-    ) -> anyhow::Result<Option<clif_ir::Value>> {
+        rvalue: &StmtKind,
+    ) -> anyhow::Result<ArrayVec<clif_ir::Value, MAX_STMT_OUTPUTS>> {
         let value = match *rvalue {
-            RValue::IConst(iconst) => Some(self.iconst(iconst)),
+            StmtKind::IConst(iconst) => array_helper::from_arr([self.iconst(iconst)]),
 
-            RValue::ArithBinOp {
+            StmtKind::ArithBinOp {
                 op,
                 lhs,
                 rhs,
             } => {
-                let (lhs, rhs) = (self.values[lhs], self.values[rhs]);
+                let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
                 let ins = self.builder.ins();
-
-                Some(match op {
+                let value = match op {
                     ArithBinOp::Add => ins.iadd(lhs, rhs),
                     ArithBinOp::Sub => ins.isub(lhs, rhs),
                     ArithBinOp::Mul => ins.imul(lhs, rhs),
-                    ArithBinOp::UDiv => emit_udiv(&mut self.builder, lhs, rhs),
-                    ArithBinOp::SDiv => emit_sdiv(&mut self.builder, lhs, rhs),
-                })
+                    ArithBinOp::UncheckedUDiv => ins.udiv(lhs, rhs),
+                    ArithBinOp::UncheckedSDiv => ins.sdiv(lhs, rhs),
+                };
+
+                array_helper::from_arr([value])
             }
 
-            RValue::FlagSettingBinOp {
+
+            StmtKind::IntCmp { cmp, lhs, rhs } => {
+                let op = Self::convert_to_intcc(cmp);
+                let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
+                array_helper::from_arr([self.builder.ins().icmp(op, lhs, rhs)])
+            }
+
+            StmtKind::IntCmpImm { cmp, lhs, rhs } => {
+                let op = Self::convert_to_intcc(cmp);
+                let lhs = self.use_value(lhs)?;
+                let rhs = rhs.cast_signed();
+                array_helper::from_arr([self.builder.ins().icmp_imm(op, lhs, rhs)])
+            }
+
+            StmtKind::Select { cond, if_true, if_false } => {
+                let (cond, if_true, if_false) = (
+                    self.use_value(cond)?,
+                    self.use_value(if_true)?,
+                    self.use_value(if_false)?,
+                );
+
+                array_helper::from_arr([self.builder.ins().select(cond, if_true, if_false)])
+            }
+
+            StmtKind::Bitwise { op, lhs, rhs } => {
+                let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
+                let ins = self.builder.ins();
+
+                let value = match op {
+                    BitwiseOp::And => ins.band(lhs, rhs),
+                    BitwiseOp::Or => ins.bor(lhs, rhs),
+                    BitwiseOp::Xor => ins.bxor(lhs, rhs),
+                };
+
+                array_helper::from_arr([value])
+            }
+            StmtKind::BitwiseImm { op, lhs, rhs } => {
+                let lhs = self.use_value(lhs)?;
+                let rhs = rhs.cast_signed();
+                let ins = self.builder.ins();
+                let value = match op {
+                    BitwiseOp::And => ins.band_imm(lhs, rhs),
+                    BitwiseOp::Or => ins.bor_imm(lhs, rhs),
+                    BitwiseOp::Xor => ins.bxor_imm(lhs, rhs),
+                };
+
+                array_helper::from_arr([value])
+            }
+
+            StmtKind::OverflowingBinOp {
                 op,
                 lhs,
                 rhs,
             } => {
-                let (lhs, rhs) = (self.values[lhs], self.values[rhs]);
-
-                let builder = &mut self.builder;
-
-                let (value, c, v) = match op {
-                    FlagSettingBinOp::Add => {
-                        // signed overflow flag
-                        let (value, overflow) = builder.ins().sadd_overflow(lhs, rhs);
-                        // unsigned carry-out
-                        let c = builder.ins().icmp(IntCC::UnsignedLessThan, value, lhs);
-
-                        (value, c, overflow)
-                    }
-
-                    FlagSettingBinOp::Sub => {
-                        let (value, overflow) = builder.ins().ssub_overflow(lhs, rhs);
-
-                        // ARM C for SUB: NOT borrow, so lhs >= rhs unsigned.
-                        let c = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, lhs, rhs);
-
-                        (value, c, overflow)
-                    }
+                let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
+                let ins = self.builder.ins();
+                let (value, overflow) = match op {
+                    OverflowingBinOp::Add => ins.sadd_overflow(lhs, rhs),
+                    OverflowingBinOp::Sub => ins.ssub_overflow(lhs, rhs),
                 };
 
-                let n = self.builder.ins().icmp_imm(IntCC::SignedLessThan, value, 0);
-                let z = self.builder.ins().icmp_imm(IntCC::Equal, value, 0);
-
-                self.lower_set_nzcv_flag_set(n, z, c, v)?;
-
-                Some(value)
+                array_helper::from_arr([value, overflow])
             }
 
-            RValue::LoadHost { width, base_ptr, offset } => {
-                Some(self.lower_host_load(width, base_ptr, offset)?)
+            StmtKind::LoadHost { width, base_ptr, offset } => {
+                array_helper::from_arr([self.lower_host_load(width, base_ptr, offset)?])
             }
 
-            RValue::StoreHost {
+            StmtKind::StoreHost {
                 base_ptr,
                 offset,
                 value,
             } => {
-                let value = self.values[value];
+                let value = self.use_value(value)?;
                 self.lower_host_store(base_ptr, offset, value)?;
-                None
+                array_helper::from_arr([])
             }
 
-            RValue::LoadHaltReason => {
-                // todo!("lower halt reason atomic load")
-                Some(self.builder.ins().iconst(clif_ir::types::I32, 0))
+            StmtKind::LoadHaltReason => {
+                let ptr = self.use_value(LValue::ARG_HALT_REASON_PTR)?;
+                let value = self.builder.ins().atomic_load(
+                    clif_ir::types::I32,
+                    Self::host_memory_flags(),
+                    ptr
+                );
+                array_helper::from_arr([value])
             }
 
-            RValue::InstructionDone => {
+            StmtKind::InstructionDone => {
                 let base_ptr = LValue::ARG_PROCESSOR_STATE;
                 let offset = offset_of!(ProcessorState, pc);
 
@@ -431,7 +329,7 @@ impl<'a> FunctionLowering<'a> {
                 let next_pc = self.builder.ins().iadd(pc, four);
                 self.lower_host_store(base_ptr, offset, next_pc)?;
 
-                None
+                array_helper::from_arr([])
             }
         };
 
@@ -501,19 +399,6 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-    fn use_value(&self, lvalue: LValue) -> anyhow::Result<clif_ir::Value> {
-        self.values
-            .get(lvalue)
-            .copied()
-            .context("internal compiler error: lvalue used before being lowered")
-    }
-
-    fn clif_block(&self, block: IrBlock) -> anyhow::Result<clif_ir::Block> {
-        self.blocks
-            .get(block)
-            .copied()
-            .context("internal compiler error: missing Cranelift block")
-    }
 
     fn int_nonzero(&mut self, value: clif_ir::Value) -> anyhow::Result<clif_ir::Value> {
         let ty = self.builder.func.dfg.value_type(value);
@@ -522,11 +407,11 @@ impl<'a> FunctionLowering<'a> {
     }
 
     #[allow(dead_code)]
-    fn ir_ty_to_clif_ty(&self, ty: IrType) -> anyhow::Result<Option<clif_ir::Type>> {
+    fn ir_ty_to_clif_ty(&self, ty: IrType) -> anyhow::Result<clif_ir::Type> {
         match ty {
-            IrType::Unit => Ok(None),
-            IrType::Int(width) => Ok(Some(Self::int_ty(width))),
-            IrType::HostPtr => Ok(Some(self.ptr_ty)),
+            IrType::Bool => Ok(clif_ir::types::I8),
+            IrType::Int(width) => Ok(Self::int_ty(width)),
+            IrType::HostPtr => Ok(self.ptr_ty),
         }
     }
 
@@ -556,6 +441,7 @@ fn exec_block_signature(module: &JITModule) -> clif_ir::Signature {
 }
 
 pub use cranelift::codegen::settings::OptLevel;
+use crate::array_helper;
 
 pub struct CraneliftCompiler {
     isa: OwnedTargetIsa
@@ -602,7 +488,7 @@ impl CraneliftCompiler {
         Ok(Self { isa })
     }
 
-    pub fn try_compile(&self, function_name: String, exec_ir: ExecIr) -> anyhow::Result<CompiledExecBlock> {
+    pub fn try_compile(&self, options: CompileOptions, exec_ir: ExecIr) -> anyhow::Result<CompiledExecBlock> {
         let builder = JITBuilder::with_isa(
             self.isa.clone(),
             cranelift::module::default_libcall_names()
@@ -612,7 +498,9 @@ impl CraneliftCompiler {
         let mut ctx = module.make_context();
         let mut builder_ctx = FunctionBuilderContext::new();
 
-        ctx.set_disasm(true);
+        if options.show_disasm {
+            ctx.set_disasm(true);
+        }
 
         ctx.func.signature = exec_block_signature(&module);
 
@@ -620,17 +508,15 @@ impl CraneliftCompiler {
             let ptr_ty = module.target_config().pointer_type();
             let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
 
-            let live_ordered_blocks = reverse_post_order_exec_ir(&exec_ir);
-
             let mut lowering =
-                FunctionLowering::new(builder, &exec_ir, &live_ordered_blocks, ptr_ty)?;
+                FunctionLowering::new(builder, &exec_ir, ptr_ty)?;
 
             lowering.lower_blocks(&exec_ir)?;
             lowering.finish();
         }
 
         let func_id = module
-            .declare_function(&function_name, Linkage::Export, &ctx.func.signature)
+            .declare_function(&options.function_name, Linkage::Export, &ctx.func.signature)
             .map_err(|err| anyhow!("declare_function failed: {err}"))?;
 
         module
@@ -638,15 +524,13 @@ impl CraneliftCompiler {
             .map_err(|err| anyhow!("define_function failed: {err}"))?;
 
 
-        // After define_function, the Context still contains the compiled result.
-        let code = ctx.compiled_code()
-            .expect("Cranelift did not leave compiled code in the context");
+        if options.show_disasm {
+            let code = ctx.compiled_code()
+                .expect("Cranelift did not leave compiled code in the context");
 
-        if let Some(disasm) = &code.vcode {
-            eprintln!("{disasm}");
-        } else {
-            eprintln!("no disassembly was produced");
+            eprintln!("{}", code.vcode.as_deref().unwrap_or("no disassembly was produced"));
         }
+
 
         module.clear_context(&mut ctx);
 

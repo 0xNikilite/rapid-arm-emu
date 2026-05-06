@@ -238,14 +238,14 @@ const SYSTEM_REG_ARCHIVE: &str = "spec/SysReg_xml_A_profile-2026-03_96.tar.gz";
 impl SystemRegisters {
     fn _load(
         _temp_dir: &TempDir,
-        interner: &Interner,
-        isa_name: &'static str,
+        _interner: &Interner,
+        _isa_name: &'static str,
     ) -> eyre::Result<Self> {
         println!("Processing System Registers");
 
         let archive = tar_ball::open_tar_gz_archive(SYSTEM_REG_ARCHIVE)?;
         for entry in archive {
-            let entry = entry?;
+            let _entry = entry?;
 
         }
 

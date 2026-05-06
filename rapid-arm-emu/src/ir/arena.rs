@@ -16,8 +16,17 @@ cfg_select! {
     }
 }
 
-#[derive(Debug, Copy, Clone, Ord, PartialOrd, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Ord, PartialOrd, PartialEq, Eq, Hash)]
 pub struct RawHandle(NonZero<HandleInt>);
+
+impl Debug for RawHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f
+            .debug_struct("RawHandle")
+            .field("index", &self.get())
+            .finish()
+    }
+}
 
 const _: () = assert!(HandleInt::BITS <= usize::BITS);
 const _: () = assert!(HandleInt::MIN == 0);
@@ -97,6 +106,8 @@ pub const fn from_raw<H: Handle>(handle: RawHandle) -> H {
     unsafe { transmute_unckecked::<RawHandle, H>(handle) }
 }
 
+unsafe impl Handle for RawHandle {}
+
 
 pub trait Storable: Sized {
     type Handle: Handle;
@@ -164,7 +175,7 @@ impl<'a, S: Storable> Reservation<'a, S> {
 }
 
 impl<S: Storable> Arena<S> {
-    pub fn reserve(&mut self) -> (S::Handle, Reservation<S>) {
+    pub fn reserve(&mut self) -> (S::Handle, Reservation<'_, S>) {
         let handle = RawHandle::new(self.0.len());
         let handle = from_raw::<S::Handle>(handle);
         let reservation = Reservation::try_reserve(self)
@@ -208,11 +219,18 @@ impl<S: Storable> IndexMut<S::Handle> for Arena<S> {
     }
 }
 
+impl<S: Debug> Debug for Arena<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <[S] as Debug>::fmt(&self.0, f)
+    }
+}
+
+
 pub struct ArenaMap<K, V>(Vec<Option<V>>, PhantomData<K>);
 
 impl<K: Handle, V> ArenaMap<K, V> {
     pub fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity), PhantomData)
+        Self(Vec::from_iter(std::iter::repeat_with(|| None).take(capacity)), PhantomData)
     }
 
     pub fn get(&self, key: K) -> Option<&V> {
@@ -237,11 +255,94 @@ fn indexing_map_handle_failed<T>() -> T {
     panic!("key not found in map")
 }
 
+// DO NOT IMPLEMENT IndexMut
 impl<K: Handle, V> Index<K> for ArenaMap<K, V> {
     type Output = V;
 
     fn index(&self, index: K) -> &Self::Output {
         self.get(index).unwrap_or_else(indexing_map_handle_failed)
+    }
+}
+
+
+pub struct ArenaSet<K>(Vec<usize>, PhantomData<K>);
+
+impl<K: Handle> ArenaSet<K> {
+    const BITS: NonZero<usize> = {
+        let bits: u32 = usize::BITS;
+        assert!(bits <= 256);
+        assert!(usize::MAX >= 256);
+
+        NonZero::new(bits as usize).unwrap()
+    };
+
+    fn reserve(&mut self, capacity: usize) {
+        let words = capacity.div_ceil(Self::BITS.get());
+        if self.0.len() < words {
+            self.0.resize(words, 0)
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut this = Self(vec![], PhantomData);
+        this.reserve(capacity);
+        this
+    }
+
+    fn index_and_mask(key: K) -> (usize, usize) {
+        let key = to_raw(key).get();
+        let index = key / Self::BITS;
+        let bit = key % Self::BITS;
+        (index, 1_usize << bit)
+    }
+
+    pub fn insert(&mut self, key: K) -> bool {
+        let (index, mask) = Self::index_and_mask(key);
+        self.reserve(index.strict_add(1));
+        let word = &mut self.0[index];
+        let was_there = (*word) & mask;
+        *word |= mask;
+
+        was_there == 0
+    }
+
+    pub fn contains(&self, key: K) -> bool {
+        let (index, mask) = Self::index_and_mask(key);
+        let row = self.0.get(index).copied().unwrap_or(0);
+        (row & mask) != 0
+    }
+
+    pub fn remove(&mut self, key: K) -> bool {
+        let (index, mask) = Self::index_and_mask(key);
+        let Some(row) = self.0.get_mut(index) else {
+            return false
+        };
+
+        let old_row = *row;
+        *row = old_row & !mask;
+        (old_row & mask) != 0
+    }
+}
+
+impl<K: Handle + Debug> Debug for ArenaSet<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let iter = self
+            .0
+            .iter()
+            .flat_map(|&bits| {
+                std::array::from_fn::<_, { ArenaSet::<RawHandle>::BITS.get() }, _>(|i| {
+                    bits & (1_usize << i)
+                })
+            })
+            .enumerate()
+            .filter_map(|(i, mask)| (mask != 0).then_some(i))
+            .map(RawHandle::new)
+            .map(from_raw::<K>);
+
+        f
+            .debug_set()
+            .entries(iter)
+            .finish()
     }
 }
 
