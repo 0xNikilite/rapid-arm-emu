@@ -1079,6 +1079,22 @@ impl ExecIrBuilder {
         self.emit_flag_setting_binop(OverflowingBinOp::Sub, lhs, rhs)
     }
 
+
+    /// Inserts a halt check immediately after a safepoint in `block`.
+    ///
+    /// `insert_at` is the statement insertion index, so the safepoint must be at
+    /// `insert_at - 1`.
+    ///
+    /// This splits `block` at `insert_at`:
+    ///
+    /// - the original block keeps `stmts[..insert_at]`;
+    /// - the original block then loads the halt reason and branches;
+    /// - the zero branch goes to a newly-created continuation block containing
+    ///   the old `stmts[insert_at..]` and the old terminator;
+    /// - the non-zero branch goes to a cold fail block that returns the halt reason.
+    ///
+    /// Returns the continuation block. Callers that are scanning forward through
+    /// the original instruction stream should resume from the returned block.
     fn insert_halt_check_at(
         &mut self,
         block: Block,

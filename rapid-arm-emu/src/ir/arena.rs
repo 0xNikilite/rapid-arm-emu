@@ -244,13 +244,31 @@ impl<K: Handle, V> ArenaMap<K, V> {
         self.0.get(to_raw(key).get()).and_then(Option::as_ref)
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+    pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
+        self.0.get_mut(to_raw(key).get()).and_then(Option::as_mut)
+    }
+
+    fn insertion_slot(&mut self, key: K) -> &mut Option<V> {
         let index = to_raw(key).get();
         if self.0.len() <= index {
             cold_path();
             self.0.resize_with(index.strict_add(1), || None);
         }
-        self.0[index].replace(value)
+
+        &mut self.0[index]
+    }
+
+    pub fn get_or_insert_with<F: FnOnce() -> V>(&mut self, key: K, with: F) -> &mut V {
+        self.insertion_slot(key).get_or_insert_with(with)
+    }
+
+
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        self.insertion_slot(key).replace(value)
+    }
+
+    pub fn remove(&mut self, key: K) -> Option<V> {
+        self.0.get_mut(to_raw(key).get()).and_then(Option::take)
     }
 
     pub fn iter(&self) -> impl Iterator<Item=(K, &V)> {
