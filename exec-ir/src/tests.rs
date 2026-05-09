@@ -2368,3 +2368,141 @@ fn vm_store_fast_path_traps_when_page_number_equals_page_count() {
     assert_memory_trap(code);
     assert_eq!(fixture.mmu.load64_le(0).unwrap(), 0);
 }
+
+#[test]
+fn vm_store_to_non_executable_page_does_not_dirty_icache_page() {
+    let mut builder = ExecIrBuilder::default();
+
+    let addr = u64_const(&mut builder, 16);
+    let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
+    builder.vm_store(addr, value);
+
+    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let mut state = ProcessorState::initial();
+
+    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+
+    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_eq!(fixture.mmu.load64_le(16).unwrap(), 0x0123_4567_89ab_cdef);
+    assert_eq!(
+        fixture.mmu.drain_dirty_icache_pages().count(),
+        0,
+        "stores to non-executable pages must not dirty icache state",
+    );
+}
+
+#[test]
+fn vm_store_to_executable_page_dirties_icache_page() {
+    let mut builder = ExecIrBuilder::default();
+
+    let addr = u64_const(&mut builder, 16);
+    let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
+    builder.vm_store(addr, value);
+
+    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
+    let mut state = ProcessorState::initial();
+
+    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+
+    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_eq!(fixture.mmu.load64_le(16).unwrap(), 0xfeed_face_cafe_beef);
+    assert_eq!(
+        fixture.mmu.drain_dirty_icache_pages().count(),
+        1,
+        "stores to executable pages must mark exactly that page dirty",
+    );
+    assert_eq!(
+        fixture.mmu.drain_dirty_icache_pages().count(),
+        0,
+        "draining dirty icache pages must clear the dirty state",
+    );
+}
+
+#[test]
+fn vm_load_from_executable_page_does_not_dirty_icache_page() {
+    let mut builder = ExecIrBuilder::default();
+
+    let addr = u64_const(&mut builder, 8);
+    let loaded = builder.vm_load(addr, IntWidth::W64);
+    builder.store_x_reg::<0>(loaded);
+
+    let fixture = VmFixture::with_bytes(
+        1,
+        MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
+        vm_pattern_byte,
+    );
+    let mut state = ProcessorState::initial();
+
+    assert_eq!(fixture.mmu.drain_dirty_icache_pages().count(), 0);
+
+    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_eq!(
+        state.x_registers[0],
+        u64::from_le_bytes(vm_pattern_array::<8>(8)),
+    );
+    assert_eq!(
+        fixture.mmu.drain_dirty_icache_pages().count(),
+        0,
+        "loads from executable pages must not dirty icache state",
+    );
+}
+
+#[test]
+fn repeated_vm_stores_to_same_executable_page_report_one_dirty_page() {
+    let mut builder = ExecIrBuilder::default();
+
+    let addr = u64_const(&mut builder, 16);
+    let value = builder.iconst(IConst::u64(0x1111_2222_3333_4444));
+    builder.vm_store(addr, value);
+
+    let addr = u64_const(&mut builder, 24);
+    let value = builder.iconst(IConst::u64(0x5555_6666_7777_8888));
+    builder.vm_store(addr, value);
+
+    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
+    let mut state = ProcessorState::initial();
+
+    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_eq!(fixture.mmu.load64_le(16).unwrap(), 0x1111_2222_3333_4444);
+    assert_eq!(fixture.mmu.load64_le(24).unwrap(), 0x5555_6666_7777_8888);
+    assert_eq!(
+        fixture.mmu.drain_dirty_icache_pages().count(),
+        1,
+        "multiple stores to one executable page should still report one dirty page",
+    );
+}
+
+#[test]
+fn vm_store_to_executable_page1_dirties_only_one_page() {
+    let mut builder = ExecIrBuilder::default();
+
+    let addr = u64_const(&mut builder, vm_page_addr(1).strict_add(32));
+    let value = builder.iconst(IConst::u64(0xaabb_ccdd_eeff_0011));
+    builder.vm_store(addr, value);
+
+    let protections = [
+        MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
+        MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
+    ];
+    let fixture = VmFixture::with_page_protections_and_bytes(&protections, |_| 0);
+    let mut state = ProcessorState::initial();
+
+    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_eq!(
+        fixture
+            .mmu
+            .load64_le(vm_page_addr(1).strict_add(32))
+            .unwrap(),
+        0xaabb_ccdd_eeff_0011,
+    );
+    assert_eq!(
+        fixture.mmu.drain_dirty_icache_pages().count(),
+        1,
+        "a store to page 1 should not dirty every executable page",
+    );
+}

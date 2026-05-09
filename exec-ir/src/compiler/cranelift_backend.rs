@@ -568,7 +568,7 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([value])
             }
 
-            StmtKind::LoadInstructionDirtyFlag(insn_dirty) => {
+            StmtKind::GetInstructionDirtyFlag(insn_dirty) => {
                 // same reasons as `StmtKind::LoadHaltReason` stated above
                 let can_move = false;
                 let ptr = self.use_value(insn_dirty)?;
@@ -747,6 +747,8 @@ impl CraneliftCompiler {
 
         ctx.func.signature = exec_block_signature(&module);
 
+        let mut clif_disasm_output = String::new();
+
         {
             let ptr_ty = module.target_config().pointer_type();
             let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
@@ -755,6 +757,11 @@ impl CraneliftCompiler {
 
             lowering.lower_blocks(&exec_ir)?;
             lowering.finish();
+
+            if options.show_disasm {
+                // do it here because afterwards the clif will get optimized
+                clif_disasm_output = ctx.func.display().to_string()
+            }
         }
 
         let func_id = module
@@ -770,9 +777,8 @@ impl CraneliftCompiler {
                 .compiled_code()
                 .expect("Cranelift did not leave compiled code in the context");
 
-            eprintln!("{} clif:\n{}", options.function_name, ctx.func.display());
             eprintln!(
-                "{name}:\ndis-assembly:\n{disasm}",
+                "{name}:\nclif:\n{clif_disasm_output}\nassembly:\n{disasm}",
                 name = options.function_name,
                 disasm = code
                     .vcode

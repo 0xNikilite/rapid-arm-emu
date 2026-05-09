@@ -532,6 +532,9 @@ enum StmtKind {
     /// loads the halt reason found at Arg::HaltReasonPtr
     /// implemntation:
     /// its a relaxed atomic 32 bit native entain load
+    /// this is more like `HasPendingHaltReasonButReturnsBitsBecauseBrZNeedsAValue`
+    /// if it returns yes then, and only then do you syncronize, because this makes
+    /// the fast path (no halt) very fast
     LoadHaltReason,
 
     /// takes the halt reason found at Arg::HaltReasonPtr
@@ -539,8 +542,8 @@ enum StmtKind {
     /// implementation: AcqRel xchg \[HaltReasonPtr] 0
     TakeHaltReason,
 
-    /// relaxed atomic byte load
-    LoadInstructionDirtyFlag(SSAValue),
+    /// **relaxed** atomic byte load
+    GetInstructionDirtyFlag(SSAValue),
 
     /// **release** atomic byte store to the value `1`
     SetInstructionDirtyFlag(SSAValue),
@@ -882,7 +885,7 @@ impl ExecIrBuilder {
 
             StmtKind::LoadHaltReason | StmtKind::TakeHaltReason => iter_from_arr([Type::I32]),
 
-            StmtKind::LoadInstructionDirtyFlag { .. } => iter_from_arr([Type::I8]),
+            StmtKind::GetInstructionDirtyFlag { .. } => iter_from_arr([Type::I8]),
             StmtKind::SetInstructionDirtyFlag { .. } => empty_iter(),
 
             StmtKind::Safepoint => empty_iter(),
@@ -1658,8 +1661,6 @@ impl ExecIrBuilder {
         })
     }
 
-    // TODO
-    //   - actually dirty the pages
     fn vm_access(&mut self, vaddr: SSAValue, access: VmAccessKind) -> Option<SSAValue> {
         assert!(matches!(self.ssa_values[vaddr].ty, Type::I64));
 
@@ -1677,14 +1678,14 @@ impl ExecIrBuilder {
 
         let page_offset = self.bitand_imm(vaddr, IConst::u64(PAGE_OFFSET_MASK));
 
-        let bytes = width.bytes_u64();
-        debug_assert!(bytes.is_power_of_two());
-
         let is_aligned_and_fits_page_check = match width {
             // a byte ptr only accesses the byte it is on
             // and is always aligned
             IntWidth::W8 => None,
             _ => {
+                let bytes = width.bytes_u64();
+                debug_assert!(bytes.is_power_of_two());
+
                 let align_mask = bytes.strict_sub(1);
                 let alignment_bits = self.bitand_imm(vaddr, IConst::u64(align_mask));
                 let is_aligned = self.icmp_imm(IntCmp::Equal, alignment_bits, IConst::u64(0));
@@ -1789,14 +1790,15 @@ impl ExecIrBuilder {
                     })
                 };
 
-                let already_dirty = unsafe {
-                    this.emit_1ret_stmt(StmtKind::LoadInstructionDirtyFlag(page_info_ptr))
+                let is_dirty = unsafe {
+                    this.emit_1ret_stmt(StmtKind::GetInstructionDirtyFlag(insn_dirty_ptr))
                 };
 
                 let set_insn_dirty = this.create_block();
-                this.terminate(Terminator::BrZ(already_dirty, continuation, set_insn_dirty));
+                this.terminate(Terminator::BrNZ(is_dirty, continuation, set_insn_dirty));
 
                 this.block_scope(set_insn_dirty, |this| {
+                    this.mark_current_block_cold();
                     unsafe {
                         this.emit_void_stmt(StmtKind::SetInstructionDirtyFlag(insn_dirty_ptr))
                     }
@@ -1902,6 +1904,7 @@ impl ExecIrBuilder {
     #[must_use]
     pub fn build(mut self) -> ExecIr {
         halt_check_pass::insert_halt_checks(&mut self);
+
         let reverse_post_order = self.topo_sort();
         ExecIr {
             ssa_values: self.ssa_values,

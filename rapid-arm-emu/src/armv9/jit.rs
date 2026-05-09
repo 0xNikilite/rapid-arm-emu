@@ -31,14 +31,10 @@ pub(crate) struct CodeBlock {
     /// `start` is not guaranteed to be the entrypoint of the chunk.
     addr: Range<HostPointer>,
 
-    machine_code_handle: exec_ir::compiler::CompiledExecChunk,
+    _machine_code_handle: exec_ir::compiler::CompiledExecChunk,
 }
 
-impl CodeBlock {
-    fn execute(&self, _state: &mut ProcessorState, _cpu: &Armv9CpuCore) -> HaltReasonInner {
-        todo!()
-    }
-}
+impl CodeBlock {}
 
 pub(crate) struct CodeCache {
     cache: HashMap<HostPointer, CodeBlock>,
