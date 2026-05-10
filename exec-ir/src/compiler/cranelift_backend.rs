@@ -10,7 +10,6 @@ use crate::{Block as IrBlock, Jump as IrJump, Type as IrType};
 use anyhow::{Context, anyhow, ensure};
 use arrayvec::ArrayVec;
 use cranelift::codegen::ir as clif_ir;
-pub use cranelift::codegen::settings::OptLevel;
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{Linkage, Module};
@@ -286,7 +285,7 @@ impl<'a> FunctionLowering<'a> {
             let mut clif_signature = self.module.make_signature();
 
             let sig = &self.exec_ir.signatures[signature];
-            for &arg in &sig.args {
+            for &arg in &sig.args[..] {
                 clif_signature
                     .params
                     .push(AbiParam::new(ir_ty_to_clif_ty(self.ptr_ty, arg)));
@@ -483,10 +482,22 @@ impl<'a> FunctionLowering<'a> {
                 array_helper::from_arr([out_ptr])
             }
 
-            StmtKind::PtrOffsetImm { base_ptr, offset } => {
-                let base_ptr = self.use_value(base_ptr)?;
-                let imm64 = i64::try_from(offset)?;
-                let output = self.builder.ins().iadd_imm(base_ptr, imm64);
+            StmtKind::IsNotNull(ptr) => {
+                let ptr = self.use_value(ptr)?;
+                let output = self.builder.ins().icmp_imm(IntCC::NotEqual, ptr, 0);
+                array_helper::from_arr([output])
+            }
+
+            StmtKind::HasTag { ptr, tag_bits } => {
+                let ptr = self.use_value(ptr)?;
+                let output = self.builder.ins().band_imm(ptr, i64::from(tag_bits));
+                array_helper::from_arr([output])
+            }
+
+            StmtKind::Untag { ptr, tag_bits } => {
+                let ptr = self.use_value(ptr)?;
+                let mask = !i64::from(tag_bits);
+                let output = self.builder.ins().band_imm(ptr, mask);
                 array_helper::from_arr([output])
             }
 
@@ -683,11 +694,22 @@ fn exec_block_signature(module: &JITModule) -> clif_ir::Signature {
 }
 
 pub struct CraneliftCompiler {
-    isa: OwnedTargetIsa,
+    compile_fast_isa: OwnedTargetIsa,
+    compile_optimized_isa: OwnedTargetIsa,
 }
 
 impl CraneliftCompiler {
-    pub fn new(opt_level: OptLevel) -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<Self> {
+        fn bool_to_str(bool: bool) -> &'static str {
+            match bool {
+                true => "true",
+                false => "false",
+            }
+        }
+
+        let isa_builder = cranelift::native::builder()
+            .map_err(|msg| anyhow!("host machine is not supported by Cranelift: {msg}"))?;
+
         let mut flag_builder = cranelift::codegen::settings::builder();
 
         // JIT code is in-process and not being linked as a PIC object.
@@ -703,6 +725,23 @@ impl CraneliftCompiler {
         // JIT code is in-process and not being linked as a PIC object.
         flag_builder.set("is_pic", "false")?;
 
+        // JIT frames are not intended to be stack-walked by profilers/debuggers.
+        // Omitting frame pointers can reduce prologue/epilogue work and keeps an
+        // extra register available on targets where the frame pointer would otherwise
+        // be reserved.
+        flag_builder.set("preserve_frame_pointers", "false")?;
+
+        // Generated JIT functions must not unwind across this boundary. We do not need
+        // DWARF/Windows unwind metadata for exceptions, panics, GC stack walking, or
+        // debugger frame reconstruction, so skip emitting it to reduce compile-time
+        // metadata work.
+        flag_builder.set("unwind_info", "false")?;
+
+        // The embedder does not need machine-code CFG metadata after codegen. We call
+        // the finalized function pointer directly and do not post-process/analyze basic
+        // block offsets or machine-code edges, so avoid generating that metadata.
+        flag_builder.set("machine_code_cfg_info", "false")?;
+
         // On at least AArch64, "colocated" calls use shorter-range relocations,
         // which might not reach all definitions; we can't handle that here, so
         // we require long-range relocation types.
@@ -710,40 +749,67 @@ impl CraneliftCompiler {
 
         flag_builder.set("preserve_frame_pointers", "false")?;
 
-        flag_builder.set(
-            "opt_level",
-            match opt_level {
-                OptLevel::None => "none",
-                OptLevel::Speed => "speed",
-                OptLevel::SpeedAndSize => "speed_and_size",
-            },
-        )?;
+        // logs are not wanted
+        flag_builder.set("regalloc_verbose_logs", "false")?;
 
-        let isa_builder = cranelift::native::builder()
-            .map_err(|msg| anyhow!("host machine is not supported by Cranelift: {msg}"))?;
+        // lower compile time by removing verfification
+        // since the IR is already pre checked and verified/trusted
+        let check_flag = bool_to_str(cfg!(debug_assertions));
+        flag_builder.set("enable_verifier", check_flag)?;
+        flag_builder.set("regalloc_checker", check_flag)?;
 
-        let isa = isa_builder
-            .finish(cranelift::codegen::settings::Flags::new(flag_builder))
+        // we aren't compiling sandboxed code; the sandbox comes as a natural extension of
+        // the IR building process where VM access is lowered
+        flag_builder.set("enable_heap_access_spectre_mitigation", "false")?;
+        flag_builder.set("enable_table_access_spectre_mitigation", "false")?;
+
+        let unoptimized_builder = {
+            let mut flags = flag_builder.clone();
+            flags.set("opt_level", "none")?;
+            flags.set("regalloc_algorithm", "single_pass")?;
+            flags
+        };
+
+        flag_builder.set("opt_level", "speed")?;
+        flag_builder.set("regalloc_algorithm", "backtracking")?;
+
+        let optimized_builder = flag_builder;
+
+        let (compile_fast_isa, compile_optimized_isa) = isa_builder
+            .finish(cranelift::codegen::settings::Flags::new(
+                unoptimized_builder,
+            ))
+            .and_then(|unopt_isa| {
+                isa_builder
+                    .finish(cranelift::codegen::settings::Flags::new(optimized_builder))
+                    .map(|opt_isa| (unopt_isa, opt_isa))
+            })
             .map_err(|err| anyhow!("Cranelift ISA creation failed: {err}"))?;
 
-        Ok(Self { isa })
+        Ok(Self {
+            compile_fast_isa,
+            compile_optimized_isa,
+        })
     }
 
     pub fn try_compile(
         &self,
         options: CompileBlockOptions,
-        exec_ir: ExecIr,
+        exec_ir: &ExecIr,
+        optimized: bool,
     ) -> anyhow::Result<CompiledExecChunk> {
-        let builder =
-            JITBuilder::with_isa(self.isa.clone(), cranelift::module::default_libcall_names());
+        let isa = match optimized {
+            true => &self.compile_optimized_isa,
+            false => &self.compile_fast_isa,
+        };
+
+        let builder = JITBuilder::with_isa(isa.clone(), cranelift::module::default_libcall_names());
 
         let mut module = JITModule::new(builder);
         let mut ctx = module.make_context();
         let mut builder_ctx = FunctionBuilderContext::new();
 
-        if options.show_disasm {
-            ctx.set_disasm(true);
-        }
+        ctx.set_disasm(options.show_disasm);
 
         ctx.func.signature = exec_block_signature(&module);
 
@@ -753,9 +819,9 @@ impl CraneliftCompiler {
             let ptr_ty = module.target_config().pointer_type();
             let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
 
-            let mut lowering = FunctionLowering::new(builder, &module, &exec_ir, ptr_ty)?;
+            let mut lowering = FunctionLowering::new(builder, &module, exec_ir, ptr_ty)?;
 
-            lowering.lower_blocks(&exec_ir)?;
+            lowering.lower_blocks(exec_ir)?;
             lowering.finish();
 
             if options.show_disasm {

@@ -3,10 +3,13 @@ use crate::ffi_support::IoMmuStatus;
 use arrayvec::ArrayVec;
 use emu_abi::array_helper;
 use emu_abi::halt_reason::{HaltReason, HaltReasonInner};
-use emu_abi::memory::{MemProt, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE_U64, Page};
+use emu_abi::memory::{
+    MemProt, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE, TLB_MASK, TLB_SIZE, TlbEntry,
+};
 use emu_abi::processor_state::{PState, ProcessorState, X_REGISTER_COUNT};
 use io_mmu::IoMMU;
 use smallvec::{SmallVec, smallvec};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::mem::offset_of;
 use std::num::NonZero;
@@ -86,8 +89,8 @@ impl_storable! {
     SSAValueData as impl pub SSAValue;
     init: {
         const ARG_PROCESSOR_STATE = SSAValueData { ty: Type::HostPtr };
-        const ARG_PAGES = SSAValueData { ty: Type::HostPtr };
-        const ARG_PAGE_COUNT = SSAValueData { ty: Type::I64 };
+        const ARG_TLB_PTR = SSAValueData { ty: Type::HostPtr };
+        const ARG_IO_MMU_GENERATION = SSAValueData { ty: Type::I64 };
         const ARG_HALT_REASON_PTR = SSAValueData { ty: Type::HostPtr };
         const ARG_IO_MMU = SSAValueData { ty: Type::HostPtr };
     }
@@ -107,8 +110,8 @@ impl_storable! {
 #[derive(Copy, Clone)]
 pub enum Arg {
     ProcessorState,
-    Pages,
-    PageCount,
+    Tlb,
+    IoMMUGeneration,
     HaltReasonPtr,
     IoMMU,
 }
@@ -135,7 +138,7 @@ impl Arg {
             }};
         }
 
-        let this = make_arr![ProcessorState, Pages, PageCount, HaltReasonPtr, IoMMU];
+        let this = make_arr![ProcessorState, Tlb, IoMMUGeneration, HaltReasonPtr, IoMMU];
 
         this.into_iter()
     }
@@ -143,8 +146,8 @@ impl Arg {
     pub fn ty(self) -> Type {
         match self {
             Arg::ProcessorState => Type::HostPtr,
-            Arg::Pages => Type::HostPtr,
-            Arg::PageCount => Type::I64,
+            Arg::Tlb => Type::HostPtr,
+            Arg::IoMMUGeneration => Type::I64,
             Arg::HaltReasonPtr => Type::HostPtr,
             Arg::IoMMU => Type::HostPtr,
         }
@@ -153,8 +156,8 @@ impl Arg {
     pub fn as_ssa_value(self) -> SSAValue {
         match self {
             Arg::ProcessorState => SSAValue::ARG_PROCESSOR_STATE,
-            Arg::Pages => SSAValue::ARG_PAGES,
-            Arg::PageCount => SSAValue::ARG_PAGE_COUNT,
+            Arg::Tlb => SSAValue::ARG_TLB_PTR,
+            Arg::IoMMUGeneration => SSAValue::ARG_IO_MMU_GENERATION,
             Arg::HaltReasonPtr => SSAValue::ARG_HALT_REASON_PTR,
             Arg::IoMMU => SSAValue::ARG_IO_MMU,
         }
@@ -322,50 +325,52 @@ type HostCallback = unsafe extern "C" fn(...);
 
 #[derive(Debug)]
 struct CallbackSignatureData {
-    args: Vec<Type>,
+    args: Cow<'static, [Type]>,
     ret: Option<Type>,
+}
+
+macro_rules! make_store_signature {
+    ($ty: ident) => {
+        CallbackSignatureData {
+            // IoMMU, tlb, vaddr, out_param
+            args: Cow::Borrowed(&[Type::HostPtr, Type::HostPtr, Type::I64, Type::$ty]),
+            // IoMmuStatus
+            ret: Some(Type::I8),
+        }
+    };
 }
 
 impl_storable! {
     CallbackSignatureData as impl CallbackSignature;
     init: {
         const LOAD_FALLBACK = CallbackSignatureData {
-            // IoMMU, vaddr, out_param
-            args: vec![Type::HostPtr, Type::I64, Type::HostPtr],
+            // IoMMU, tlb, vaddr, out_param
+            args: Cow::Borrowed(&[Type::HostPtr, Type::HostPtr, Type::I64, Type::HostPtr]),
             // IoMmuStatus
             ret: Some(Type::I8),
         };
 
-        const STORE_I16_FALLBACK = CallbackSignatureData {
-            // IoMMU, vaddr, value
-            args: vec![Type::HostPtr, Type::I64, Type::I16],
-            // IoMmuStatus
-            ret: Some(Type::I8),
-        };
-
-        const STORE_I32_FALLBACK = CallbackSignatureData {
-            // IoMMU, vaddr, value
-            args: vec![Type::HostPtr, Type::I64, Type::I32],
-            // IoMmuStatus
-            ret: Some(Type::I8),
-        };
-
-        const STORE_I64_FALLBACK = CallbackSignatureData {
-            // IoMMU, vaddr, value
-            args: vec![Type::HostPtr, Type::I64, Type::I64],
-            // IoMmuStatus
-            ret: Some(Type::I8),
-        };
+        const STORE_I8_FALLBACK = make_store_signature!(I8);
+        const STORE_I16_FALLBACK = make_store_signature!(I16);
+        const STORE_I32_FALLBACK = make_store_signature!(I32);
+        const STORE_I64_FALLBACK = make_store_signature!(I64);
     }
 }
 
 fn io_mmu_load_callback_for_width(width: IntWidth) -> (HostCallback, CallbackSignature) {
-    fn cast<T>(f: unsafe extern "C" fn(*const IoMMU, u64, *mut T) -> IoMmuStatus) -> HostCallback {
+    fn cast<T>(
+        f: unsafe extern "C" fn(
+            *const IoMMU,
+            *mut [TlbEntry; TLB_SIZE],
+            u64,
+            *mut T,
+        ) -> IoMmuStatus,
+    ) -> HostCallback {
         unsafe { std::mem::transmute(f) }
     }
 
     let host_cb = match width {
-        IntWidth::W8 => unreachable!("8-bit load fallback is currently unnecessary"),
+        IntWidth::W8 => cast(ffi_support::io_mmu_load_byte),
         IntWidth::W16 => cast(ffi_support::io_mmu_load16_le),
         IntWidth::W32 => cast(ffi_support::io_mmu_load32_le),
         IntWidth::W64 => cast(ffi_support::io_mmu_load64_le),
@@ -376,13 +381,16 @@ fn io_mmu_load_callback_for_width(width: IntWidth) -> (HostCallback, CallbackSig
 
 fn io_mmu_store_callback_for_width(width: IntWidth) -> (HostCallback, CallbackSignature) {
     fn cast<T>(
-        f: unsafe extern "C" fn(*const IoMMU, u64, T) -> IoMmuStatus,
+        f: unsafe extern "C" fn(*const IoMMU, *mut [TlbEntry; TLB_SIZE], u64, T) -> IoMmuStatus,
     ) -> unsafe extern "C" fn(...) {
         unsafe { std::mem::transmute(f) }
     }
 
     match width {
-        IntWidth::W8 => unreachable!("8-bit store fallback is currently unnecessary"),
+        IntWidth::W8 => (
+            cast(ffi_support::io_mmu_store_byte),
+            CallbackSignature::STORE_I8_FALLBACK,
+        ),
         IntWidth::W16 => (
             cast(ffi_support::io_mmu_store16_le),
             CallbackSignature::STORE_I16_FALLBACK,
@@ -501,9 +509,16 @@ enum StmtKind {
         elem_size: NonZero<usize>,
     },
 
-    PtrOffsetImm {
-        base_ptr: SSAValue,
-        offset: isize,
+    IsNotNull(SSAValue),
+
+    HasTag {
+        ptr: SSAValue,
+        tag_bits: u8,
+    },
+
+    Untag {
+        ptr: SSAValue,
+        tag_bits: u8,
     },
 
     HostCallback {
@@ -868,9 +883,13 @@ impl ExecIrBuilder {
 
             StmtKind::StoreHost { .. } => empty_iter(),
 
-            StmtKind::PtrOffsetImm { .. }
-            | StmtKind::LoadStackPtr { .. }
-            | StmtKind::PtrAdd { .. } => iter_from_arr([Type::HostPtr]),
+            StmtKind::LoadStackPtr { .. } | StmtKind::PtrAdd { .. } => {
+                iter_from_arr([Type::HostPtr])
+            }
+
+            StmtKind::IsNotNull(_) => iter_from_arr([Type::Bool]),
+            StmtKind::HasTag { .. } => iter_from_arr([Type::Bool]),
+            StmtKind::Untag { .. } => iter_from_arr([Type::HostPtr]),
 
             StmtKind::HostCallback { signature, .. } => match self.signatures[signature].ret {
                 None => empty_iter(),
@@ -1101,7 +1120,7 @@ impl ExecIrBuilder {
         args: SmallVec<SSAValue, HOST_CB_SMALL_ARGS>,
     ) -> Option<SSAValue> {
         let sig = &self.signatures[signature];
-        let args_ty = sig.args.as_slice();
+        let args_ty: &[Type] = &sig.args;
         assert_eq!(args_ty.len(), args.len(), "mismatched host call lengths");
         for (&arg_ty, &arg) in args_ty.iter().zip(args.iter()) {
             assert_eq!(
@@ -1173,7 +1192,7 @@ impl ExecIrBuilder {
         })
     }
 
-    fn binop_type_guard<T>(
+    fn bitwise_type_guard<T>(
         &mut self,
         lhs: Type,
         rhs: Type,
@@ -1181,30 +1200,27 @@ impl ExecIrBuilder {
     ) -> T {
         match (lhs, rhs) {
             (Type::Bool, Type::Bool) => emit(self),
+            (Type::HostPtr, Type::HostPtr) => emit(self),
             (Type::Int(width1), Type::Int(width2)) => match width1 == width2 {
                 true => emit(self),
                 false => panic!("mismatched integer widths used for bitwise op"),
             },
 
-            (Type::HostPtr, Type::HostPtr) => {
-                panic!("can't do pointer bitwise operations currently")
-            }
-
             _ => panic!("mismatched types used for bitwise operation"),
         }
     }
 
-    fn emit_binop(&mut self, op: BitwiseOp, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
+    fn emit_bitwise(&mut self, op: BitwiseOp, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
         let lhs_ty = self.ssa_values[lhs].ty;
         let rhs_ty = self.ssa_values[rhs].ty;
-        self.binop_type_guard(lhs_ty, rhs_ty, |this| unsafe {
+        self.bitwise_type_guard(lhs_ty, rhs_ty, |this| unsafe {
             this.emit_1ret_stmt(StmtKind::Bitwise { op, lhs, rhs })
         })
     }
 
-    fn emit_binop_imm(&mut self, op: BitwiseOp, lhs: SSAValue, rhs: IConst) -> SSAValue {
+    fn emit_bitwise_imm(&mut self, op: BitwiseOp, lhs: SSAValue, rhs: IConst) -> SSAValue {
         let lhs_ty = self.ssa_values[lhs].ty;
-        self.binop_type_guard(lhs_ty, Type::Int(rhs.width), |this| unsafe {
+        self.bitwise_type_guard(lhs_ty, Type::Int(rhs.width), |this| unsafe {
             this.emit_1ret_stmt(StmtKind::BitwiseImm {
                 op,
                 lhs,
@@ -1214,27 +1230,27 @@ impl ExecIrBuilder {
     }
 
     pub fn bitor(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
-        self.emit_binop(BitwiseOp::Or, lhs, rhs)
+        self.emit_bitwise(BitwiseOp::Or, lhs, rhs)
     }
 
     pub fn bitand(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
-        self.emit_binop(BitwiseOp::And, lhs, rhs)
+        self.emit_bitwise(BitwiseOp::And, lhs, rhs)
     }
 
     pub fn bitxor(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
-        self.emit_binop(BitwiseOp::Xor, lhs, rhs)
+        self.emit_bitwise(BitwiseOp::Xor, lhs, rhs)
     }
 
     pub fn bitor_imm(&mut self, lhs: SSAValue, rhs: IConst) -> SSAValue {
-        self.emit_binop_imm(BitwiseOp::Or, lhs, rhs)
+        self.emit_bitwise_imm(BitwiseOp::Or, lhs, rhs)
     }
 
     pub fn bitand_imm(&mut self, lhs: SSAValue, rhs: IConst) -> SSAValue {
-        self.emit_binop_imm(BitwiseOp::And, lhs, rhs)
+        self.emit_bitwise_imm(BitwiseOp::And, lhs, rhs)
     }
 
     pub fn bitxor_imm(&mut self, lhs: SSAValue, rhs: IConst) -> SSAValue {
-        self.emit_binop_imm(BitwiseOp::Xor, lhs, rhs)
+        self.emit_bitwise_imm(BitwiseOp::Xor, lhs, rhs)
     }
 
     fn emit_shift_op(&mut self, op: ShiftOp, value: SSAValue, bits: u8) -> SSAValue {
@@ -1609,6 +1625,21 @@ struct FallbackAccess {
 }
 
 impl ExecIrBuilder {
+    fn ptr_is_not_null(&mut self, ptr: SSAValue) -> SSAValue {
+        assert_eq!(self.ssa_values[ptr].ty, Type::HostPtr);
+        unsafe { self.emit_1ret_stmt(StmtKind::IsNotNull(ptr)) }
+    }
+
+    fn has_tag(&mut self, ptr: SSAValue, tag_bits: u8) -> SSAValue {
+        assert_eq!(self.ssa_values[ptr].ty, Type::HostPtr);
+        unsafe { self.emit_1ret_stmt(StmtKind::HasTag { ptr, tag_bits }) }
+    }
+
+    fn untag_ptr(&mut self, ptr: SSAValue, tag_bits: u8) -> SSAValue {
+        assert_eq!(self.ssa_values[ptr].ty, Type::HostPtr);
+        unsafe { self.emit_1ret_stmt(StmtKind::Untag { ptr, tag_bits }) }
+    }
+
     fn emit_io_mmu_fallback(
         &mut self,
         access: VmAccessKind,
@@ -1619,19 +1650,25 @@ impl ExecIrBuilder {
         let fallback_block = self.create_block();
         self.block_scope(fallback_block, |this| {
             this.mark_current_block_cold();
-            let (out_param, (host_cb, sig), args) = match access {
+            let (out_param, (host_cb, sig), arg) = match access {
                 VmAccessKind::Load { .. } => {
                     let stack_ptr = this.get_scratch_space_ptr(width);
                     let func = io_mmu_load_callback_for_width(width);
-                    let args = smallvec![SSAValue::ARG_IO_MMU, vaddr, stack_ptr];
-                    (Some(stack_ptr), func, args)
+                    (Some(stack_ptr), func, stack_ptr)
                 }
                 VmAccessKind::Store { value } => {
                     let func = io_mmu_store_callback_for_width(width);
-                    let args = smallvec![SSAValue::ARG_IO_MMU, vaddr, value];
-                    (None, func, args)
+                    (None, func, value)
                 }
             };
+
+            let args = smallvec![
+                SSAValue::ARG_IO_MMU,
+                SSAValue::ARG_TLB_PTR,
+                vaddr,
+                // either an out param or a value to store
+                arg
+            ];
 
             let status = unsafe { this.call_host(host_cb, sig, args).unwrap() };
             const { assert!(IoMmuStatus::Ok as u8 == 0) };
@@ -1663,89 +1700,92 @@ impl ExecIrBuilder {
 
         let width = access.width(self);
 
-        let page_index = self.ushr_imm(vaddr, PAGE_SHIFT);
-        let page_is_in_bounds = self.icmp(
-            IntCmp::UnsignedLessThan,
-            page_index,
-            SSAValue::ARG_PAGE_COUNT,
+        let return_trap_block = self.get_halt_block(HaltReason::MEMORY_TRAP.into_inner());
+        let fallback_access = self.emit_io_mmu_fallback(access, width, vaddr, return_trap_block);
+
+        let page_number = self.ushr_imm(vaddr, PAGE_SHIFT);
+        let tlb_index = self.bitand_imm(page_number, IConst::u64(TLB_MASK));
+
+        let tlb_entry_ptr = unsafe {
+            self.emit_1ret_stmt(StmtKind::PtrAdd {
+                base_ptr: SSAValue::ARG_TLB_PTR,
+                offset: tlb_index,
+                elem_size: const { NonZero::new(size_of::<TlbEntry>()).unwrap() },
+            })
+        };
+
+        let tlb_generation = unsafe {
+            self.emit_1ret_stmt(StmtKind::LoadHost {
+                ty: LoadType::Int(IntWidth::W64),
+                base_ptr: tlb_entry_ptr,
+                offset: offset_of!(TlbEntry, generation),
+                // tlb access is always valid; since there are always TLB_SIZE
+                // entries
+                can_move: true,
+            })
+        };
+
+        let io_mmu_generation_matches = self.icmp(
+            IntCmp::Equal,
+            SSAValue::ARG_IO_MMU_GENERATION,
+            tlb_generation,
         );
 
-        let return_trap_block = self.get_halt_block(HaltReason::MEMORY_TRAP.into_inner());
-        self.assert_or_jmp_to(page_is_in_bounds, true, return_trap_block);
+        self.assert_or_jmp_to(io_mmu_generation_matches, true, fallback_access.block);
+
+        let page_number_found = unsafe {
+            self.emit_1ret_stmt(StmtKind::LoadHost {
+                ty: LoadType::Int(IntWidth::W64),
+                base_ptr: tlb_entry_ptr,
+                offset: offset_of!(TlbEntry, virtual_page_number),
+                // tlb access is always valid; since there are always TLB_SIZE
+                // entries
+                can_move: true,
+            })
+        };
+
+        let page_number_matches = self.icmp(IntCmp::Equal, page_number, page_number_found);
+
+        self.assert_or_jmp_to(page_number_matches, true, fallback_access.block);
+
+        let tagged_page_ptr = unsafe {
+            self.emit_1ret_stmt(StmtKind::LoadHost {
+                ty: LoadType::HostPtr,
+                base_ptr: tlb_entry_ptr,
+                offset: offset_of!(TlbEntry, tagged_page_ptr),
+                // tlb access is always valid; since there are always TLB_SIZE
+                // entries
+                can_move: true,
+            })
+        };
+
+        let is_mapped = self.ptr_is_not_null(tagged_page_ptr);
+
+        self.assert_or_jmp_to(is_mapped, true, fallback_access.block);
 
         let page_offset = self.bitand_imm(vaddr, IConst::u64(PAGE_OFFSET_MASK));
 
-        let is_aligned_and_fits_page_check = match width {
-            // a byte ptr only accesses the byte it is on
-            // and is always aligned
-            IntWidth::W8 => None,
-            _ => {
-                let bytes = width.bytes_u64();
-                debug_assert!(bytes.is_power_of_two());
+        // a byte ptr only accesses the byte it is on and is always aligned
+        if !matches!(width, IntWidth::W8) {
+            let bytes = width.bytes_u64();
+            debug_assert!(bytes.is_power_of_two());
 
-                let align_mask = bytes.strict_sub(1);
-                let alignment_bits = self.bitand_imm(vaddr, IConst::u64(align_mask));
-                let is_aligned = self.icmp_imm(IntCmp::Equal, alignment_bits, IConst::u64(0));
+            let align_mask = bytes.strict_sub(1);
+            let alignment_bits = self.bitand_imm(vaddr, IConst::u64(align_mask));
+            let is_aligned = self.icmp_imm(IntCmp::Equal, alignment_bits, IConst::u64(0));
 
-                // access_fits_in_page = page_offset + bytes <= PAGE_SIZE_U64;
-                // access_fits_in_page = page_offset <= PAGE_SIZE_U64 - bytes;
-                // access_fits_in_page = page_offset < PAGE_SIZE_U64 - bytes + 1;
-                let access_fits_in_page = self.icmp_imm(
-                    IntCmp::UnsignedLessThan,
-                    page_offset,
-                    IConst::u64(PAGE_SIZE_U64.strict_sub(bytes).strict_add(1)),
-                );
+            // naturally aligned access into a page
+            // always fits in said page
+            const { assert!(PAGE_SIZE.is_multiple_of(IntWidth::MAX.bytes() as usize)) }
 
-                Some(self.bitand(access_fits_in_page, is_aligned))
-            }
-        };
-
-        let mut fallback_access = None::<FallbackAccess>;
-        if let Some(normal_access) = is_aligned_and_fits_page_check {
-            let fallback_access = fallback_access.insert(self.emit_io_mmu_fallback(
-                access,
-                width,
-                vaddr,
-                return_trap_block,
-            ));
-
-            self.assert_or_jmp_to(normal_access, true, fallback_access.block);
+            self.assert_or_jmp_to(is_aligned, true, fallback_access.block);
         }
 
-        let page_info_ptr = unsafe {
-            self.emit_1ret_stmt(StmtKind::PtrAdd {
-                base_ptr: SSAValue::ARG_PAGES,
-                offset: page_index,
-                elem_size: const { NonZero::new(size_of::<Page>()).unwrap() },
-            })
-        };
-
-        let page_protections = unsafe {
-            self.emit_1ret_stmt(StmtKind::LoadHost {
-                ty: LoadType::Int(IntWidth::W8),
-                base_ptr: page_info_ptr,
-                offset: offset_of!(Page, mem_prot),
-                // this page might be out of bounds; not safe to access
-                can_move: false,
-            })
-        };
-
-        // this is loaded before the assert, so that it can be moved to inside after the assert
-        // or stay here; whichever the optimizer finds best
-        let aligned_page_ptr = unsafe {
-            self.emit_1ret_stmt(StmtKind::LoadHost {
-                ty: LoadType::HostPtr,
-                base_ptr: page_info_ptr,
-                offset: offset_of!(Page, ptr),
-                // this page might be out of bounds; not safe to access
-                can_move: false,
-            })
-        };
-
-        let required_perms = IConst::u8(access.required_perms().bits());
-        let op_allowed = self.bitand_imm(page_protections, required_perms);
+        let required_perms = access.required_perms().bits();
+        let op_allowed = self.has_tag(tagged_page_ptr, required_perms);
         self.assert_or_jmp_to(op_allowed, true, return_trap_block);
 
+        let aligned_page_ptr = self.untag_ptr(tagged_page_ptr, MemProt::all().bits());
         let ret_value = {
             match access {
                 VmAccessKind::Load { .. } => Some(unsafe {
@@ -1769,21 +1809,21 @@ impl ExecIrBuilder {
         };
 
         if let VmAccessKind::Store { .. } = access {
-            // if page_is_executable # cold
-            //    if page_not_alredy_dirty # cold
-            //       set_page_dirty
-
-            let executable = IConst::u8(MemProt::EXECUTE.bits());
-            let page_is_executable = self.bitand_imm(page_protections, executable);
+            let executable = MemProt::EXECUTE.bits();
+            let page_is_executable = self.has_tag(tagged_page_ptr, executable);
             let check_if_not_already_dirty = self.create_block();
             let continuation =
                 self.assert_or_jmp_to(page_is_executable, false, check_if_not_already_dirty);
 
             self.block_scope(check_if_not_already_dirty, |this| {
                 let insn_dirty_ptr = unsafe {
-                    this.emit_1ret_stmt(StmtKind::PtrOffsetImm {
-                        base_ptr: page_info_ptr,
-                        offset: isize::try_from(offset_of!(Page, insn_dirty)).unwrap(),
+                    this.emit_1ret_stmt(StmtKind::LoadHost {
+                        ty: LoadType::HostPtr,
+                        base_ptr: tlb_entry_ptr,
+                        offset: offset_of!(TlbEntry, insn_dirty_ptr),
+                        // tlb access is always valid; since there are always TLB_SIZE
+                        // entries
+                        can_move: true,
                     })
                 };
 
@@ -1805,10 +1845,6 @@ impl ExecIrBuilder {
                 })
             })
         }
-
-        let Some(fallback_access) = fallback_access else {
-            return ret_value;
-        };
 
         let returns = match (ret_value, fallback_access.value) {
             (Some(ret_normal), Some(ret_fallback)) => Some((ret_normal, ret_fallback)),
@@ -1869,7 +1905,7 @@ impl ExecIrBuilder {
 
         let mut postorder = Vec::with_capacity(self.blocks.len());
 
-        let mut dfs_stack = vec![DfsFrame::Enter(Block::ENTRYPOINT)];
+        let mut dfs_stack: SmallVec<DfsFrame, 128> = smallvec![DfsFrame::Enter(Block::ENTRYPOINT)];
 
         while let Some(frame) = dfs_stack.pop() {
             match frame {
@@ -1905,7 +1941,6 @@ impl ExecIrBuilder {
     #[must_use]
     pub fn build(mut self) -> ExecIr {
         halt_check_pass::insert_halt_checks(&mut self);
-
         let reverse_post_order = self.topo_sort();
         ExecIr {
             ssa_values: self.ssa_values,

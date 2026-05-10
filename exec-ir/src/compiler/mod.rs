@@ -1,11 +1,13 @@
 use crate::ExecIr;
 use crate::compiler::cranelift_backend::CraneliftCompiler;
 use crate::compiler::sync_cell::SyncCell;
-use emu_abi::as_ffi::AsFFI;
 use emu_abi::halt_reason::AtomicHaltReason;
+use emu_abi::internal_traits::{AsFFI, GetTlbGeneration};
+use emu_abi::memory::{TLB_SIZE, Tlb, TlbEntry};
 use emu_abi::processor_state::ProcessorState;
 use io_mmu::IoMMU;
 use std::any::Any;
+use std::num::NonZero;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -16,8 +18,8 @@ mod sync_cell;
 
 type ExecBlockFFI = unsafe extern "C" fn(
     processor_state: &mut ProcessorState,
-    pages: *const emu_abi::memory::Page,
-    page_count: u64,
+    tlb_entries: *mut [TlbEntry; TLB_SIZE],
+    io_mmu_generation: NonZero<u64>,
     halt_reason_ptr: *const AtomicU32,
     io_mmu: *const IoMMU,
 ) -> u32;
@@ -39,17 +41,29 @@ impl CompiledExecChunk {
         }
     }
 
+    /// # Safety
+    /// the tlb **must** have only had entries filled from this specific IoMMU
+    /// not a clone of it, but **the** same IoMMU itself
     #[inline]
-    pub fn call(
+    pub unsafe fn call(
         &self,
         processor_state: &mut ProcessorState,
+        tlb: &mut Tlb,
         halt_reason: &AtomicHaltReason,
         io_mmu: &IoMMU,
     ) -> u32 {
         let halt_reason: *const AtomicU32 = halt_reason.as_ffi();
-        let (pages, page_count, _liftime_marker) = io_mmu.as_ffi();
-        unsafe { (self.ffi)(processor_state, pages, page_count, halt_reason, io_mmu) }
+        let tlb = tlb.entries();
+        let io_mmu_gen = io_mmu.get_generation();
+        unsafe { (self.ffi)(processor_state, tlb, io_mmu_gen, halt_reason, io_mmu) }
     }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum CompileTier {
+    // the mystical Tier0, when there is an even faster backend
+    Tier1,
+    Tier2,
 }
 
 // currently we only support cranelift but that should change soon with LLVM support
@@ -68,8 +82,8 @@ impl Default for ExecIrCompiler {
     fn default() -> Self {
         Self {
             next_function_id: AtomicUsize::new(0),
-            cranelift_compiler: CraneliftCompiler::new(cranelift_backend::OptLevel::Speed).unwrap(),
-            show_disasm: true,
+            cranelift_compiler: CraneliftCompiler::new().unwrap(),
+            show_disasm: false,
         }
     }
 }
@@ -80,12 +94,16 @@ impl ExecIrCompiler {
         self
     }
 
-    pub fn compile(&self, exec_ir: ExecIr) -> CompiledExecChunk {
-        self.try_compile(exec_ir)
+    pub fn compile(&self, exec_ir: &ExecIr, tier: CompileTier) -> CompiledExecChunk {
+        self.try_compile(exec_ir, tier)
             .unwrap_or_else(|err| panic!("failed to compile ExecIr: {err}"))
     }
 
-    pub fn try_compile(&self, exec_ir: ExecIr) -> anyhow::Result<CompiledExecChunk> {
+    pub fn try_compile(
+        &self,
+        exec_ir: &ExecIr,
+        tier: CompileTier,
+    ) -> anyhow::Result<CompiledExecChunk> {
         let function_name = {
             let id = self.next_function_id.fetch_add(1, Ordering::Relaxed);
             format!("exec_chunk_{id}")
@@ -96,6 +114,17 @@ impl ExecIrCompiler {
             show_disasm: self.show_disasm,
         };
 
-        self.cranelift_compiler.try_compile(options, exec_ir)
+        match tier {
+            CompileTier::Tier1 => {
+                let optimized = false;
+                self.cranelift_compiler
+                    .try_compile(options, exec_ir, optimized)
+            }
+            CompileTier::Tier2 => {
+                let optimized = true;
+                self.cranelift_compiler
+                    .try_compile(options, exec_ir, optimized)
+            }
+        }
     }
 }

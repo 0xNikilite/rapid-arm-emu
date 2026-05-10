@@ -19,7 +19,7 @@ fn instruction_done_increments_pc_by_four_each_time() {
 
     run_success(builder, &mut state);
 
-    assert_eq!(state.pc, 0x100c);
+    assert_eq!(state.pc, 0x1000 + 4 * 3);
 }
 
 #[test]
@@ -43,9 +43,11 @@ fn explicit_halt_check_every_instruction_still_retires_all_instructions() {
 
 #[test]
 fn automatic_halt_check_split_at_default_interval_preserves_pc_progress() {
-    let mut builder = ExecIrBuilder::default();
-
     let instructions = 1024_u64;
+
+    let halt_check_every = NonZero::new(instructions / 4).unwrap().try_into().unwrap();
+
+    let mut builder = ExecIrBuilder::with_config(IrBuilderConfig { halt_check_every });
 
     for _ in 0..instructions {
         builder.next_insn();

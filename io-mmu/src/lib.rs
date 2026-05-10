@@ -42,15 +42,17 @@
 //!    `store_byte/store16/store32/store64`.
 
 use crate::cpu_fabric::CpuFabric;
-use emu_abi::as_ffi::AsFFI;
 use emu_abi::convert::{u64_add_usize, u64_to_usize};
+use emu_abi::internal_traits::{
+    GetTlbGeneration, GetTlbIdentifier, IoMMUByteRawAccess, IoMMURawIntAccess,
+};
 use emu_abi::memory::{
-    HostPointer, MemProt, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE, Page, PagePointer,
+    HostPointer, MemProt, PAGE_OFFSET_MASK, PAGE_SHIFT, PAGE_SIZE, Page, PageNumber, PagePointer,
+    TlbIdentifierToken,
 };
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::hint::cold_path;
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::num::NonZero;
 use std::ptr::NonNull;
@@ -229,8 +231,8 @@ macro_rules! impl_load_ops {
                 ty: [<u $bits>],
                 load_function: [<load $bits _le>],
                 store_function: [<store $bits _le>],
-                load: [<load $bits>],
-                store: [<store $bits>]
+                load: [<load $bits _le>],
+                store: [<store $bits _le>]
                 ),+
             }
         }
@@ -258,15 +260,12 @@ impl_load_ops! {
 ///
 /// The implementation permits concurrent access and models the armv9 memory model.
 pub struct IoMMU {
+    identifier_token: TlbIdentifierToken,
+    generation: NonZero<u64>,
     pages: Vec<Page>,
     pending_dirty_pages: Mutex<HashSet<PagePointer>>,
     fabric: CpuFabric,
 }
-
-// Safety: all interior mutability is guarded explicitly with mutable references;
-//         and all access is atomic/tearing and doesn't lead to UB
-unsafe impl Send for IoMMU {}
-unsafe impl Sync for IoMMU {}
 
 impl IoMMU {
     /// Creates an empty MMU with no mapped pages.
@@ -274,8 +273,10 @@ impl IoMMU {
     /// All accesses fault until memory is mapped with [`IoMMU::map_memory`].
     pub fn new(fabric: CpuFabric) -> Self {
         Self {
+            identifier_token: TlbIdentifierToken::new_token(),
             pages: vec![],
             pending_dirty_pages: Mutex::new(HashSet::new()),
+            generation: const { NonZero::new(1).unwrap() },
             fabric,
         }
     }
@@ -290,6 +291,16 @@ impl IoMMU {
             pending_dirty_pages.insert(unsafe { PagePointer::new(page) });
         }
         page.unmap()
+    }
+
+    fn bump_generation_ptr(generation: &mut NonZero<u64>) {
+        *generation = (*generation)
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("IoMMU mapping generation overflowed"))
+    }
+
+    fn bump_generation(&mut self) {
+        Self::bump_generation_ptr(&mut self.generation)
     }
 
     /// Maps a host memory region into the MMU page table.
@@ -344,9 +355,15 @@ impl IoMMU {
             // Safety: start page is smaller than end page, and end page fits in ram
             let start_page = u64_to_usize(start_page).unwrap_unchecked();
 
+            if end_page.unchecked_sub(start_page) != 0 {
+                self.bump_generation();
+            }
+
             if self.pages.len() < end_page {
                 self.pages.resize_with(end_page, || Page::UNMAPPED)
             }
+
+            let new_protections = protections.into_cannon();
 
             let base_ptr = NonNull::new_unchecked(ptr.cast::<AtomicU8>());
             for page_idx in start_page..end_page {
@@ -354,7 +371,8 @@ impl IoMMU {
                 Self::unmap_page(page, self.pending_dirty_pages.get_mut());
                 let backing_page_idx = page_idx.unchecked_sub(start_page);
                 let page_ptr = base_ptr.add(backing_page_idx.unchecked_mul(PAGE_SIZE));
-                *page = Page::mapped(page_ptr, protections);
+                // Safety: `new_protections` masks out any junk bits
+                *page = Page::mapped(page_ptr, new_protections);
             }
         }
 
@@ -365,7 +383,7 @@ impl IoMMU {
         &mut self,
         start: u64,
         size: u64,
-    ) -> Result<(&mut [Page], &mut HashSet<PagePointer>), MemoryFault> {
+    ) -> Result<(&mut [Page], &mut NonZero<u64>, &mut HashSet<PagePointer>), MemoryFault> {
         let end = start.checked_add(size).ok_or_else(MemoryFault::fault)?;
         let end_page = div_page_size_checked(end)?;
         let start_page = div_page_size_checked(start)?;
@@ -380,12 +398,24 @@ impl IoMMU {
             .get_mut(start_page..end_page)
             .ok_or_else(MemoryFault::fault)?;
 
-        Ok((pages, self.pending_dirty_pages.get_mut()))
+        Ok((
+            pages,
+            &mut self.generation,
+            self.pending_dirty_pages.get_mut(),
+        ))
     }
 
     pub fn unmap_memory(&mut self, start: u64, size: u64) -> Result<(), MemoryFault> {
-        let (pages, pending_dirty_pages) = self.get_pages_mut(start, size)?;
+        let (pages, generation, pending_dirty_pages) = self.get_pages_mut(start, size)?;
+
+        let mut gen_bumped = false;
+
         for page in pages {
+            if page.is_mapped() && !gen_bumped {
+                Self::bump_generation_ptr(generation);
+                gen_bumped = true;
+            }
+
             Self::unmap_page(page, pending_dirty_pages);
         }
         Ok(())
@@ -399,13 +429,21 @@ impl IoMMU {
     ) -> Result<(), MemoryFault> {
         // changing memory protections doesn't change the mapping of the host pointer
         // therefore there is no need to touch the pending dirty pages
-        let (pages, _) = self.get_pages_mut(start, size)?;
+        let (pages, generation, _) = self.get_pages_mut(start, size)?;
         for page in &mut *pages {
             ensure!(page.is_mapped());
         }
 
+        let new_protections = protections.into_cannon();
+
+        let mut generation_bumped = false;
+
         // Safety: all pages are mapped
         for page in pages {
+            if page.mem_prot != new_protections && !generation_bumped {
+                Self::bump_generation_ptr(generation);
+                generation_bumped = true;
+            }
             unsafe { page.mem_protect(protections) }
         }
 
@@ -546,45 +584,110 @@ impl IoMMU {
     }
 }
 
+impl IoMMU {
+    #[inline]
+    pub(crate) fn single_page_aligned_access<const ALIGN: u8>(
+        &self,
+        vaddr: u64,
+    ) -> Result<(PageNumber, &Page, usize), MemoryFault> {
+        const {
+            assert!(ALIGN.is_power_of_two());
+            assert!(PAGE_SIZE.is_power_of_two());
+            assert!(PAGE_SIZE.is_multiple_of(ALIGN as usize));
+        }
+
+        ensure!(vaddr.is_multiple_of(u64::from(ALIGN)));
+
+        let (page_num, offset) = div_rem_page_size(vaddr);
+        let page = u64_to_usize(page_num)
+            .and_then(|page_idx| self.pages.get(page_idx))
+            .ok_or_else(MemoryFault::fault)?;
+
+        Ok((PageNumber(page_num), page, offset))
+    }
+}
+
+impl IoMMUByteRawAccess for IoMMU {
+    type Error = MemoryFault;
+
+    #[inline(always)]
+    fn load_byte_raw(&self, vaddr: u64) -> Result<(PageNumber, &Page, u8), MemoryFault> {
+        const ALIGN: u8 = 1;
+        let (page_num, page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
+        // Safety: offset is the result of x % PAGE_SIZE and so must be smaller than page size
+        let byte = unsafe { page.load_byte(offset)? };
+        Ok((page_num, page, byte))
+    }
+
+    #[inline(always)]
+    fn store_byte_raw(&self, vaddr: u64, value: u8) -> Result<(PageNumber, &Page), MemoryFault> {
+        const ALIGN: u8 = 1;
+        let (page_num, page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
+        // Safety: offset is the result of x % PAGE_SIZE and so must be smaller than page size
+        unsafe { page.store_byte(offset, value)? }
+
+        Ok((page_num, page))
+    }
+}
+
+impl IoMMU {
+    pub fn load_byte(&self, vaddr: u64) -> Result<u8, MemoryFault> {
+        let (_page_num, _page, byte) = self.load_byte_raw(vaddr)?;
+        Ok(byte)
+    }
+
+    pub fn store_byte(&self, vaddr: u64, value: u8) -> Result<(), MemoryFault> {
+        let (_page_num, _page) = self.store_byte_raw(vaddr, value)?;
+        Ok(())
+    }
+}
+
+#[derive(Copy, Clone)]
 struct SecondPage<'a> {
     page: &'a Page,
-    overflow_amount: NonZero<u8>,
+    overflow_amount: NonZero<usize>,
 }
 
 struct SmallAccess<'a> {
+    page_num: PageNumber,
     base_page: &'a Page,
     base_page_offset: usize,
     second_page: Option<SecondPage<'a>>,
 }
 
 impl IoMMU {
+    #[inline(always)]
     fn static_small_multibyte_acces<const BYTES: u8>(
         &self,
         vaddr: u64,
     ) -> Result<SmallAccess<'_>, MemoryFault> {
         const {
+            assert!(BYTES.is_power_of_two());
             assert!(BYTES > 1);
             assert!((BYTES as usize) < PAGE_SIZE);
             assert!(PAGE_SIZE.checked_add(BYTES as usize).is_some());
         }
 
+        // Safety: `BYTES` < 256 < u16::MAX <= usize::MAX
+        let byte_count = usize::from(BYTES);
+
         let (base_page_idx, base_page_offset) = div_rem_page_size(vaddr);
+        let page_num = PageNumber(base_page_idx);
         let (base_page_idx, base_page) = u64_to_usize(base_page_idx)
             .and_then(|page_idx| Some((page_idx, self.pages.get(page_idx)?)))
             .ok_or_else(MemoryFault::fault)?;
 
         // TODO safety comments
 
-        let end_offset = unsafe { base_page_offset.unchecked_add(usize::from(BYTES)) };
+        let end_offset = unsafe { base_page_offset.unchecked_add(byte_count) };
 
         let second_page = match end_offset > PAGE_SIZE {
             false => None,
             true => {
                 cold_path();
-                let overflow_amount =
-                    unsafe { u8::try_from(end_offset.unchecked_sub(PAGE_SIZE)).unwrap_unchecked() };
+                let overflow_amount = unsafe { end_offset.unchecked_sub(PAGE_SIZE) };
 
-                unsafe { core::hint::assert_unchecked(overflow_amount < BYTES) }
+                unsafe { core::hint::assert_unchecked(overflow_amount < byte_count) }
 
                 let overflow_amount = unsafe { NonZero::new_unchecked(overflow_amount) };
 
@@ -601,6 +704,7 @@ impl IoMMU {
         };
 
         Ok(SmallAccess {
+            page_num,
             base_page,
             base_page_offset,
             second_page,
@@ -609,219 +713,265 @@ impl IoMMU {
 }
 
 macro_rules! emit_multi_word_load_store {
+    {
+        @folded
+        $([
+            bits: $bits: tt,
+            ty: $ty: ty,
+            load_name: $load_name: ident,
+            memops_load_name: $memops_load_name: ident,
+            store_name: $store_name: ident $(,)?
+        ])+
+    } => {
+        $(impl IoMMURawIntAccess<$ty> for IoMMU {
+            #[inline(always)]
+            fn load_raw(&self, vaddr: u64) -> Result<(PageNumber, &Page, Option<&Page>, $ty), MemoryFault> {
+                let access = self.static_small_multibyte_acces::<{ $bits / 8 }>(vaddr)?;
+                let value = match access.second_page {
+                    // SAFETY:
+                    // `static_small_multibyte_acces` returned `None` for `second_page`, so
+                    // this access is fully contained in `base_page`.
+                    //
+                    // Therefore:
+                    //
+                    //   base_page_offset + size_of::<u$bits>() <= PAGE_SIZE
+                    //
+                    // which satisfies the safety requirement of `Page::load$bits`.
+                    None => unsafe { access.base_page.$load_name(access.base_page_offset)? },
+
+                    Some(second_page) => unsafe {
+                        cold_path();
+
+                        // The access crosses the page boundary.
+                        //
+                        // `overflow_amount` is the number of bytes that must be read from
+                        // the start of the second page. The remaining bytes come from the
+                        // end of the base page.
+                        //
+                        // Instead of doing byte-by-byte loads, we load:
+                        //
+                        //   1. one aligned little-endian word ending at the end of the base page
+                        //   2. one aligned little-endian word starting at the beginning of the second page
+                        //
+                        // Then we shift/or the two words to reconstruct the requested
+                        // little-endian value.
+
+                        let hi_page_ptr = second_page.page.get_data_ptr(MemProt::READ)?;
+                        let lo_page_ptr = access.base_page.get_data_ptr(MemProt::READ)?;
+
+
+                        // SAFETY:
+                        // In the crossing case:
+                        //
+                        //   end_offset      = base_page_offset + BYTES
+                        //   overflow_amount = end_offset - PAGE_SIZE
+                        //
+                        // Therefore:
+                        //
+                        //   base_page_offset - overflow_amount
+                        // = base_page_offset - (base_page_offset + BYTES - PAGE_SIZE)
+                        // = PAGE_SIZE - BYTES
+                        let lo_offset = const { PAGE_SIZE.strict_sub($bits / 8) };
+
+                        // SAFETY:
+                        // `hi_page_ptr` points to the start of the second page's readable
+                        // data. Offset `0` is valid for a full `$bits`-wide load because
+                        // `BYTES == $bits / 8` and `BYTES < PAGE_SIZE`.
+                        //
+                        // The aligned operation is valid because page data is assumed to be
+                        // aligned sufficiently for these aligned page-boundary loads.
+                        let hi_ptr = hi_page_ptr.as_ptr();
+
+                        // SAFETY:
+                        // From the proof above:
+                        //
+                        //   lo_offset == PAGE_SIZE - BYTES
+                        //
+                        // so `lo_ptr` points to the first byte of the final `$bits`-wide
+                        // word in the base page.
+                        //
+                        // This means the load is fully contained inside the base page and
+                        // ends exactly at the page boundary.
+                        //
+                        // The aligned operation is valid because this pointer is page-end
+                        // aligned for a `$bits`-wide word, assuming `PAGE_SIZE` is a
+                        // multiple of `BYTES`.
+                        let lo_ptr = lo_page_ptr.byte_add(lo_offset).as_ptr();
+
+
+                        let hi = memops::$memops_load_name(hi_ptr);
+                        let lo = memops::$memops_load_name(lo_ptr);
+
+                        // SAFETY:
+                        // `overflow_amount` is a `NonZero<u8>`, so it is at least `1`.
+                        // `static_small_multibyte_acces` also guarantees
+                        // `overflow_amount < BYTES`.
+                        //
+                        // Therefore:
+                        //
+                        //   0 < overflow_amount * 8 < $bits
+                        //
+                        // So multiplying by 8 cannot overflow `u8` for the supported
+                        // widths, and the resulting bit offset is strictly less than the
+                        // integer width.
+                        let bit_offset = u32::try_from(
+                            second_page.overflow_amount.get().unchecked_mul(8)
+                        )
+                        .unwrap_unchecked();
+
+                        // SAFETY:
+                        // Since `bit_offset < $bits`, this subtraction cannot underflow.
+                        //
+                        // Also, because `bit_offset > 0`, `hi_shift` is strictly less than
+                        // `$bits`.
+                        let hi_shift = ($bits as u32).unchecked_sub(bit_offset);
+                        let lo_shift = bit_offset;
+
+                        // SAFETY:
+                        // Both shift amounts are in `1..$bits`, so neither unchecked shift
+                        // uses an invalid shift amount.
+                        //
+                        // `lo >> lo_shift` discards the bytes before the requested virtual
+                        // address in the base-page word.
+                        //
+                        // `hi << hi_shift` moves the bytes from the second page into the
+                        // high end of the result.
+                        //
+                        // OR-ing both pieces reconstructs the requested little-endian
+                        // `$bits` value spanning the two pages.
+                        hi.unchecked_shl(hi_shift) | lo.unchecked_shr(lo_shift)
+                    }
+                };
+
+                Ok((
+                    access.page_num,
+                    access.base_page,
+                    access.second_page.map(|page| page.page),
+                    value
+                ))
+            }
+
+            #[inline(always)]
+            fn store_raw(&self, vaddr: u64, value: $ty) -> Result<(PageNumber, &Page, Option<&Page>), Self::Error> {
+                let access = self.static_small_multibyte_acces::<{ $bits / 8 }>(vaddr)?;
+                match access.second_page {
+                    // SAFETY:
+                    // `static_small_multibyte_acces` returned `None` for `second_page`, so
+                    // this access is fully contained in `base_page`.
+                    //
+                    // Therefore:
+                    //
+                    //   base_page_offset + size_of::<u$bits>() <= A::PAGE_SIZE
+                    //
+                    // which satisfies the safety requirement of `Page::store$bits`.
+                    None => unsafe {
+                        access.base_page.$store_name(access.base_page_offset, value)?
+                    },
+
+                    Some(second_page) => unsafe {
+                        // Note: we can't load 2 words and combine them like the load case
+                        //       since that would alter/mess with the atomicity of the bytes
+                        //       next to the value
+                        let bytes = value.to_le_bytes();
+
+                        let hi_page = &second_page.page;
+                        let lo_page = &access.base_page;
+
+                        let hi_page_ptr = hi_page.get_data_ptr(MemProt::WRITE)?;
+                        let lo_page_ptr = lo_page.get_data_ptr(MemProt::WRITE)?;
+
+                        let overflow = usize::from(second_page.overflow_amount.get());
+
+
+                        let mut active_ptr = hi_page_ptr.add(overflow).as_ptr();
+                        let mut i = bytes.len();
+                        for _ in 0..overflow {
+                            active_ptr = active_ptr.sub(1);
+                            i = i.unchecked_sub(1);
+                            let byte = *bytes.get_unchecked(i);
+                            memops::store_byte(active_ptr, byte)
+                        }
+
+                        active_ptr = lo_page_ptr
+                            .add(const { PAGE_SIZE.strict_sub(1) })
+                            .as_ptr();
+
+                        loop {
+                            i = i.unchecked_sub(1);
+                            let byte = *bytes.get_unchecked(i);
+                            memops::store_byte(active_ptr, byte);
+
+                            if i == 0 {
+                                break
+                            }
+                            active_ptr = active_ptr.sub(1)
+                        }
+
+                        lo_page.set_insn_dirty();
+                        hi_page.set_insn_dirty();
+                    }
+                }
+
+                Ok((
+                    access.page_num,
+                    access.base_page,
+                    access.second_page.map(|page| page.page),
+                ))
+            }
+        })+
+
+        impl IoMMU {$(
+            /// Loads a little-endian scalar from virtual memory.
+            ///
+            /// The access requires read permission for every page it touches. If the access
+            /// crosses a page boundary, both pages must be mapped and readable.
+            ///
+            /// Atomicity follows the target ARM CPU's single-copy atomicity guarantees for
+            /// naturally aligned scalar accesses of this width. Cross-page accesses may be
+            /// implemented as multiple operations and should not be treated as a single
+            /// atomic access.
+            ///
+            /// Returns [`MemoryFault`] on unmapped access, permission failure, or overflow.
+            ///
+            /// This safe function must not invoke undefined behavior.
+            pub fn $load_name(&self, vaddr: u64) -> Result<$ty, MemoryFault> {
+                let (_page_num, _page, _second_page, value) = self.load_raw(vaddr)?;
+                Ok(value)
+            }
+
+            /// Stores a little-endian scalar into virtual memory.
+            ///
+            /// The access requires write permission for every page it touches. If the access
+            /// crosses a page boundary, both pages must be mapped and writable.
+            ///
+            /// Atomicity follows the target ARM CPU's single-copy atomicity guarantees for
+            /// naturally aligned scalar accesses of this width. Cross-page accesses may be
+            /// implemented as multiple operations and should not be treated as a single
+            /// atomic access.
+            ///
+            /// Returns [`MemoryFault`] on unmapped access, permission failure, overflow, or
+            /// required alignment failure.
+            ///
+            /// This safe function must not invoke undefined behavior.
+            pub fn $store_name(&self, vaddr: u64, value: $ty) -> Result<(), MemoryFault> {
+                let (_page_num, _page, _second_page) = self.store_raw(vaddr, value)?;
+                Ok(())
+            }
+        )+}
+    };
+
     ($($bits: tt),+ $(,)?) => {
         pastey::paste! {
-            impl IoMMU {$(
-                /// Loads a little-endian scalar from virtual memory.
-                ///
-                /// The access requires read permission for every page it touches. If the access
-                /// crosses a page boundary, both pages must be mapped and readable.
-                ///
-                /// Atomicity follows the target ARM CPU's single-copy atomicity guarantees for
-                /// naturally aligned scalar accesses of this width. Cross-page accesses may be
-                /// implemented as multiple operations and should not be treated as a single
-                /// atomic access.
-                ///
-                /// Returns [`MemoryFault`] on unmapped access, permission failure, or overflow.
-                ///
-                /// This safe function must not invoke undefined behavior.
-                #[inline(always)]
-                pub fn [<load $bits _le>](&self, vaddr: u64) -> Result<[<u $bits>], MemoryFault> {
-                    let access = self.static_small_multibyte_acces::<{ $bits / 8 }>(vaddr)?;
-                    match access.second_page {
-                        // SAFETY:
-                        // `static_small_multibyte_acces` returned `None` for `second_page`, so
-                        // this access is fully contained in `base_page`.
-                        //
-                        // Therefore:
-                        //
-                        //   base_page_offset + size_of::<u$bits>() <= PAGE_SIZE
-                        //
-                        // which satisfies the safety requirement of `Page::load$bits`.
-                        None => unsafe { access.base_page.[<load $bits>](access.base_page_offset) },
-
-                        Some(second_page) => unsafe {
-                            cold_path();
-
-                            // The access crosses the page boundary.
-                            //
-                            // `overflow_amount` is the number of bytes that must be read from
-                            // the start of the second page. The remaining bytes come from the
-                            // end of the base page.
-                            //
-                            // Instead of doing byte-by-byte loads, we load:
-                            //
-                            //   1. one aligned little-endian word ending at the end of the base page
-                            //   2. one aligned little-endian word starting at the beginning of the second page
-                            //
-                            // Then we shift/or the two words to reconstruct the requested
-                            // little-endian value.
-
-                            let hi_page_ptr = second_page.page.get_data_ptr(MemProt::READ)?;
-                            let lo_page_ptr = access.base_page.get_data_ptr(MemProt::READ)?;
-
-
-                            // SAFETY:
-                            // In the crossing case:
-                            //
-                            //   end_offset      = base_page_offset + BYTES
-                            //   overflow_amount = end_offset - PAGE_SIZE
-                            //
-                            // Therefore:
-                            //
-                            //   base_page_offset - overflow_amount
-                            // = base_page_offset - (base_page_offset + BYTES - PAGE_SIZE)
-                            // = PAGE_SIZE - BYTES
-                            let lo_offset = const { PAGE_SIZE.strict_sub($bits / 8) };
-
-                            // SAFETY:
-                            // `hi_page_ptr` points to the start of the second page's readable
-                            // data. Offset `0` is valid for a full `$bits`-wide load because
-                            // `BYTES == $bits / 8` and `BYTES < PAGE_SIZE`.
-                            //
-                            // The aligned operation is valid because page data is assumed to be
-                            // aligned sufficiently for these aligned page-boundary loads.
-                            let hi_ptr = hi_page_ptr.as_ptr();
-
-                            // SAFETY:
-                            // From the proof above:
-                            //
-                            //   lo_offset == PAGE_SIZE - BYTES
-                            //
-                            // so `lo_ptr` points to the first byte of the final `$bits`-wide
-                            // word in the base page.
-                            //
-                            // This means the load is fully contained inside the base page and
-                            // ends exactly at the page boundary.
-                            //
-                            // The aligned operation is valid because this pointer is page-end
-                            // aligned for a `$bits`-wide word, assuming `PAGE_SIZE` is a
-                            // multiple of `BYTES`.
-                            let lo_ptr = lo_page_ptr.byte_add(lo_offset).as_ptr();
-
-
-                            let hi = memops::[<load $bits _le_aligned>](hi_ptr);
-                            let lo = memops::[<load $bits _le_aligned>](lo_ptr);
-
-                            // SAFETY:
-                            // `overflow_amount` is a `NonZero<u8>`, so it is at least `1`.
-                            // `static_small_multibyte_acces` also guarantees
-                            // `overflow_amount < BYTES`.
-                            //
-                            // Therefore:
-                            //
-                            //   0 < overflow_amount * 8 < $bits
-                            //
-                            // So multiplying by 8 cannot overflow `u8` for the supported
-                            // widths, and the resulting bit offset is strictly less than the
-                            // integer width.
-                            let bit_offset = u32::from(
-                                second_page.overflow_amount.get().unchecked_mul(8)
-                            );
-
-                            // SAFETY:
-                            // Since `bit_offset < $bits`, this subtraction cannot underflow.
-                            //
-                            // Also, because `bit_offset > 0`, `hi_shift` is strictly less than
-                            // `$bits`.
-                            let hi_shift = ($bits as u32).unchecked_sub(bit_offset);
-                            let lo_shift = bit_offset;
-
-                            // SAFETY:
-                            // Both shift amounts are in `1..$bits`, so neither unchecked shift
-                            // uses an invalid shift amount.
-                            //
-                            // `lo >> lo_shift` discards the bytes before the requested virtual
-                            // address in the base-page word.
-                            //
-                            // `hi << hi_shift` moves the bytes from the second page into the
-                            // high end of the result.
-                            //
-                            // OR-ing both pieces reconstructs the requested little-endian
-                            // `$bits` value spanning the two pages.
-                            Ok(hi.unchecked_shl(hi_shift) | lo.unchecked_shr(lo_shift))
-                        }
-                    }
-                }
-
-                /// Stores a little-endian scalar into virtual memory.
-                ///
-                /// The access requires write permission for every page it touches. If the access
-                /// crosses a page boundary, both pages must be mapped and writable.
-                ///
-                /// Atomicity follows the target ARM CPU's single-copy atomicity guarantees for
-                /// naturally aligned scalar accesses of this width. Cross-page accesses may be
-                /// implemented as multiple operations and should not be treated as a single
-                /// atomic access.
-                ///
-                /// Returns [`MemoryFault`] on unmapped access, permission failure, overflow, or
-                /// required alignment failure.
-                ///
-                /// This safe function must not invoke undefined behavior.
-                #[inline(always)]
-                pub fn [<store $bits _le>](&self, vaddr: u64, value: [<u $bits>]) -> Result<(), MemoryFault> {
-                    let access = self.static_small_multibyte_acces::<{ $bits / 8 }>(vaddr)?;
-
-                    match access.second_page {
-                        // SAFETY:
-                        // `static_small_multibyte_acces` returned `None` for `second_page`, so
-                        // this access is fully contained in `base_page`.
-                        //
-                        // Therefore:
-                        //
-                        //   base_page_offset + size_of::<u$bits>() <= A::PAGE_SIZE
-                        //
-                        // which satisfies the safety requirement of `Page::store$bits`.
-                        None => unsafe {
-                            access.base_page.[<store $bits>](access.base_page_offset, value)
-                        },
-
-                        Some(second_page) => unsafe {
-                            // Note: we can't load 2 words and combine them like the load case
-                            //       since that would alter/mess with the atomicity of the bytes
-                            //       next to the value
-                            let bytes = value.to_le_bytes();
-
-                            let hi_page = &second_page.page;
-                            let lo_page = &access.base_page;
-
-                            let hi_page_ptr = hi_page.get_data_ptr(MemProt::WRITE)?;
-                            let lo_page_ptr = lo_page.get_data_ptr(MemProt::WRITE)?;
-
-                            let overflow = usize::from(second_page.overflow_amount.get());
-
-
-                            let mut active_ptr = hi_page_ptr.add(overflow).as_ptr();
-                            let mut i = bytes.len();
-                            for _ in 0..overflow {
-                                active_ptr = active_ptr.sub(1);
-                                i = i.unchecked_sub(1);
-                                let byte = *bytes.get_unchecked(i);
-                                memops::store_byte(active_ptr, byte)
-                            }
-
-                            active_ptr = lo_page_ptr
-                                .add(const { PAGE_SIZE.strict_sub(1) })
-                                .as_ptr();
-
-                            loop {
-                                i = i.unchecked_sub(1);
-                                let byte = *bytes.get_unchecked(i);
-                                memops::store_byte(active_ptr, byte);
-
-                                if i == 0 {
-                                    break
-                                }
-                                active_ptr = active_ptr.sub(1)
-                            }
-
-                            lo_page.set_insn_dirty();
-                            hi_page.set_insn_dirty();
-                            Ok(())
-                        }
-                    }
-                }
-            )+}
+            emit_multi_word_load_store! {
+                @folded
+                $([
+                    bits: $bits,
+                    ty: [<u $bits>],
+                    load_name: [<load $bits _le>],
+                    memops_load_name: [<load $bits _le_aligned>],
+                    store_name: [<store $bits _le>]
+                ])+
+            }
         }
     };
 }
@@ -829,45 +979,9 @@ macro_rules! emit_multi_word_load_store {
 emit_multi_word_load_store! { 64, 32, 16 }
 
 impl IoMMU {
-    pub(crate) fn single_page_aligned_access<const ALIGN: u8>(
-        &self,
-        vaddr: u64,
-    ) -> Result<(&Page, usize), MemoryFault> {
-        const {
-            assert!(ALIGN.is_power_of_two());
-            assert!(PAGE_SIZE.is_power_of_two());
-            assert!(PAGE_SIZE.is_multiple_of(ALIGN as usize));
-        }
-
-        ensure!(vaddr.is_multiple_of(u64::from(ALIGN)));
-
-        let (page, offset) = div_rem_page_size(vaddr);
-        let page = u64_to_usize(page)
-            .and_then(|page_idx| self.pages.get(page_idx))
-            .ok_or_else(MemoryFault::fault)?;
-
-        Ok((page, offset))
-    }
-
-    pub fn load_byte(&self, vaddr: u64) -> Result<u8, MemoryFault> {
-        const ALIGN: u8 = 1;
-        let (page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
-        // Safety: offset is the result of x % PAGE_SIZE and so must be smaller than page size
-        unsafe { page.load_byte(offset) }
-    }
-
-    pub fn store_byte(&self, vaddr: u64, value: u8) -> Result<(), MemoryFault> {
-        const ALIGN: u8 = 1;
-        let (page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
-        // Safety: offset is the result of x % PAGE_SIZE and so must be smaller than page size
-        unsafe { page.store_byte(offset, value) }
-    }
-}
-
-impl IoMMU {
     pub(crate) fn fetch_aarch64_full(&self, vaddr: u64) -> Result<(HostPointer, u32), MemoryFault> {
         const ALIGN: u8 = 4;
-        let (page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
+        let (_page_num, page, offset) = self.single_page_aligned_access::<ALIGN>(vaddr)?;
         let data_ptr = page.get_data_ptr(MemProt::EXECUTE)?;
         unsafe {
             let word_ptr = data_ptr.add(offset);
@@ -899,16 +1013,15 @@ impl IoMMU {
     }
 }
 
-impl AsFFI for IoMMU {
-    type Inetrface<'a> = (*const Page, u64, PhantomData<&'a [Page]>);
+impl GetTlbIdentifier for IoMMU {
+    fn tlb_ident(&self) -> TlbIdentifierToken {
+        self.identifier_token.clone()
+    }
+}
 
-    fn as_ffi(&self) -> Self::Inetrface<'_> {
-        // mapped pages count must be less than or equal u64::MAX >> PAGE_SHIFT
-        let len = unsafe { u64::try_from(self.pages.len()).unwrap_unchecked() };
-
-        let ptr = self.pages.as_ptr();
-
-        (ptr, len, PhantomData)
+impl GetTlbGeneration for IoMMU {
+    fn get_generation(&self) -> NonZero<u64> {
+        self.generation
     }
 }
 

@@ -33,6 +33,7 @@ features = [
     "zeroable_atomics",
     "zeroable_maybe_uninit",
     "zeroable_unwind_fn",
+    "extern_crate_alloc"
 ]
 
 [workspace.lints.rust]

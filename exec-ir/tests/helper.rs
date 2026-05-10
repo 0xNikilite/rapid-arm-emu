@@ -4,8 +4,9 @@
 )]
 
 use emu_abi::halt_reason::AtomicHaltReason;
+use emu_abi::memory::Tlb;
 use emu_abi::processor_state::ProcessorState;
-use exec_ir::compiler::{CompiledExecChunk, ExecIrCompiler};
+use exec_ir::compiler::{CompileTier, CompiledExecChunk, ExecIrCompiler};
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, SSAValue, Terminator};
 use io_mmu::IoMMU;
 use io_mmu::cpu_fabric::CpuFabric;
@@ -19,7 +20,7 @@ static COMPILER: LazyLock<ExecIrCompiler> =
     LazyLock::new(|| ExecIrCompiler::default().with_show_disassmbly());
 
 pub fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
-    COMPILER.compile(builder.build())
+    COMPILER.compile(&builder.build(), CompileTier::Tier1)
 }
 
 pub fn call_compiled_full(
@@ -31,7 +32,9 @@ pub fn call_compiled_full(
 ) -> u32 {
     let halt_reason = AtomicHaltReason::new();
     setup(processor_state, io_mmu, &halt_reason);
-    let trap = compiled.call(processor_state, &halt_reason, io_mmu);
+    let tlb = &mut *Tlb::new_boxed();
+    // Safety: this is a new fresh Tlb so it has no entries filled already
+    let trap = unsafe { compiled.call(processor_state, tlb, &halt_reason, io_mmu) };
     post_process(processor_state, io_mmu, &halt_reason);
     trap
 }

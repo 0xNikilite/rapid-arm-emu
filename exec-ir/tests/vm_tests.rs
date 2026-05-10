@@ -1,8 +1,8 @@
 use crate::helper::{
-    call_compiled_full, compile, run, run_with_mmu, store_int_equals_as_x_reg, u64_const,
+    call_compiled_full, compile, run_with_mmu, store_int_equals_as_x_reg, u64_const,
 };
 use emu_abi::halt_reason::{HaltReason, HaltReasonInner};
-use emu_abi::memory::{MemProt, PAGE_SIZE};
+use emu_abi::memory::{MemProt, PAGE_SIZE, TLB_SIZE};
 use emu_abi::processor_state::ProcessorState;
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
 use io_mmu::IoMMU;
@@ -117,6 +117,49 @@ impl VmFixture {
     }
 }
 
+struct SparseVmFixture {
+    mmu: IoMMU,
+    _backing: Vec<VmPageBacking>,
+}
+
+impl SparseVmFixture {
+    fn with_mapped_pages_and_bytes(
+        pages: &[(usize, MemProt)],
+        mut byte: impl FnMut(usize, usize) -> u8,
+    ) -> Self {
+        assert!(!pages.is_empty());
+
+        let mut mmu = IoMMU::new(CpuFabric::new());
+        let mut backing = Vec::with_capacity(pages.len());
+        let page_size = u64::try_from(PAGE_SIZE).unwrap();
+
+        for &(page, protections) in pages {
+            let mut page_backing = VmPageBacking::new(1);
+
+            for (offset, dst) in page_backing.as_mut_slice().iter_mut().enumerate() {
+                *dst = byte(page, offset);
+            }
+
+            unsafe {
+                mmu.map_memory(
+                    vm_page_addr(page),
+                    page_backing.get_page(0).as_mut_ptr(),
+                    page_size,
+                    protections,
+                )
+                .unwrap();
+            }
+
+            backing.push(page_backing);
+        }
+
+        Self {
+            mmu,
+            _backing: backing,
+        }
+    }
+}
+
 fn run_success_with_mmu(
     builder: ExecIrBuilder,
     processor_state: &mut ProcessorState,
@@ -133,7 +176,7 @@ fn assert_memory_trap(code: u32) {
 }
 
 #[test]
-fn vm_load64_fast_path_reads_mapped_memory() {
+fn vm_load64_reads_mapped_memory_after_tlb_miss() {
     let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 8);
@@ -152,7 +195,7 @@ fn vm_load64_fast_path_reads_mapped_memory() {
 }
 
 #[test]
-fn vm_store64_fast_path_writes_mapped_memory() {
+fn vm_store64_writes_mapped_memory_after_tlb_miss() {
     let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, 16);
@@ -253,7 +296,8 @@ fn vm_load_traps_when_page_is_out_of_bounds() {
     let mut state = ProcessorState::initial();
     state.x_registers[0] = 0xfeed_face;
 
-    let code = run(builder, &mut state);
+    let mmu = IoMMU::new(CpuFabric::new());
+    let code = run_with_mmu(builder, &mut state, &mmu);
 
     assert_memory_trap(code);
     assert_eq!(state.x_registers[0], 0xfeed_face);
@@ -407,20 +451,17 @@ fn vm_aligned_fast_path_stores_all_widths_to_page0_nonzero_offsets() {
 }
 
 #[test]
-fn vm_fast_path_load_uses_page_number_not_page_offset_for_page0_offset8() {
+fn vm_tlb_hit_load_uses_cached_entry_for_same_page_and_offset() {
     let mut builder = ExecIrBuilder::default();
 
+    // The first access populates the TLB through the IO-MMU fallback. The second
+    // access should use the cached TLB entry rather than direct Page metadata.
     let addr = u64_const(&mut builder, 8);
+    let _ = builder.vm_load(addr, IntWidth::W64);
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let mut protections = vec![MemProt::READ | MemProt::WRITE; 9];
-
-    // If the fast path incorrectly indexes page-table entries by page_offset,
-    // vaddr 8 on page 0 will read Page[8].mem_prot instead of Page[0].mem_prot.
-    protections[8] = MemProt::WRITE;
-
-    let fixture = VmFixture::with_page_protections_and_bytes(&protections, vm_page_tagged_byte);
+    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
     let mut state = ProcessorState::initial();
 
     run_success_with_mmu(builder, &mut state, &fixture.mmu);
@@ -432,10 +473,206 @@ fn vm_fast_path_load_uses_page_number_not_page_offset_for_page0_offset8() {
 }
 
 #[test]
-fn vm_fast_path_load_uses_page_number_not_zero_for_page1_offset0() {
+fn vm_tlb_collision_load_does_not_reuse_different_virtual_page_entry() {
+    let mut builder = ExecIrBuilder::default();
+    let alias_page = TLB_SIZE;
+
+    // These pages map to the same TLB slot when the index is page_index & TLB_MASK.
+    let page0_addr = u64_const(&mut builder, vm_page_addr(0));
+    let page0_loaded = builder.vm_load(page0_addr, IntWidth::W64);
+    builder.store_x_reg::<0>(page0_loaded);
+
+    let alias_addr = u64_const(&mut builder, vm_page_addr(alias_page));
+    let alias_loaded = builder.vm_load(alias_addr, IntWidth::W64);
+    builder.store_x_reg::<1>(alias_loaded);
+
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[
+            (0, MemProt::READ | MemProt::WRITE),
+            (alias_page, MemProt::READ | MemProt::WRITE),
+        ],
+        |page, offset| tlb_collision_byte(page, offset, alias_page),
+    );
+    let mut state = ProcessorState::initial();
+
+    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_eq!(
+        state.x_registers[0],
+        u64::from_le_bytes(tlb_collision_array::<8>(0, 0, alias_page)),
+    );
+    assert_eq!(
+        state.x_registers[1],
+        u64::from_le_bytes(tlb_collision_array::<8>(alias_page, 0, alias_page)),
+    );
+    assert_ne!(
+        state.x_registers[0], state.x_registers[1],
+        "aliasing TLB pages must not resolve to the same host page",
+    );
+}
+
+#[test]
+fn vm_tlb_collision_store_does_not_write_through_different_virtual_page_entry() {
+    let mut builder = ExecIrBuilder::default();
+    let alias_page = TLB_SIZE;
+
+    let page0_addr = u64_const(&mut builder, vm_page_addr(0));
+    let page0_value = builder.iconst(IConst::u64(0x1111_2222_3333_4444));
+    builder.vm_store(page0_addr, page0_value);
+
+    let alias_addr = u64_const(&mut builder, vm_page_addr(alias_page));
+    let alias_value = builder.iconst(IConst::u64(0xaaaa_bbbb_cccc_dddd));
+    builder.vm_store(alias_addr, alias_value);
+
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[
+            (0, MemProt::READ | MemProt::WRITE),
+            (alias_page, MemProt::READ | MemProt::WRITE),
+        ],
+        |_, _| 0,
+    );
+    let mut state = ProcessorState::initial();
+
+    run_success_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_eq!(
+        fixture.mmu.load64_le(vm_page_addr(0)).unwrap(),
+        0x1111_2222_3333_4444,
+    );
+    assert_eq!(
+        fixture.mmu.load64_le(vm_page_addr(alias_page)).unwrap(),
+        0xaaaa_bbbb_cccc_dddd,
+    );
+}
+
+#[test]
+fn vm_tlb_collision_load_to_unmapped_page_traps_instead_of_reusing_old_entry() {
+    let mut builder = ExecIrBuilder::default();
+    let alias_page = TLB_SIZE;
+
+    let page0_addr = u64_const(&mut builder, vm_page_addr(0));
+    let _ = builder.vm_load(page0_addr, IntWidth::W64);
+
+    let alias_addr = u64_const(&mut builder, vm_page_addr(alias_page));
+    let loaded = builder.vm_load(alias_addr, IntWidth::W64);
+    builder.store_x_reg::<0>(loaded);
+
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[(0, MemProt::READ | MemProt::WRITE)],
+        |page, offset| tlb_collision_byte(page, offset, alias_page),
+    );
+    let mut state = ProcessorState::initial();
+    state.x_registers[0] = 0x1234_5678_9abc_def0;
+
+    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_memory_trap(code);
+    assert_eq!(state.x_registers[0], 0x1234_5678_9abc_def0);
+}
+
+#[test]
+fn vm_tlb_collision_store_to_unmapped_page_traps_instead_of_reusing_old_entry() {
+    let mut builder = ExecIrBuilder::default();
+    let alias_page = TLB_SIZE;
+
+    let page0_addr = u64_const(&mut builder, vm_page_addr(0));
+    let page0_loaded = builder.vm_load(page0_addr, IntWidth::W64);
+    builder.store_x_reg::<0>(page0_loaded);
+
+    let alias_addr = u64_const(&mut builder, vm_page_addr(alias_page));
+    let alias_value = builder.iconst(IConst::u64(0xaaaa_bbbb_cccc_dddd));
+    builder.vm_store(alias_addr, alias_value);
+
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[(0, MemProt::READ | MemProt::WRITE)],
+        |page, offset| tlb_collision_byte(page, offset, alias_page),
+    );
+    let page0_before = fixture.mmu.load64_le(vm_page_addr(0)).unwrap();
+    let mut state = ProcessorState::initial();
+
+    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_memory_trap(code);
+    assert_eq!(
+        fixture.mmu.load64_le(vm_page_addr(0)).unwrap(),
+        page0_before
+    );
+}
+
+#[test]
+fn vm_tlb_collision_load_permission_check_uses_colliding_target_page() {
+    let mut builder = ExecIrBuilder::default();
+    let alias_page = TLB_SIZE;
+
+    let page0_addr = u64_const(&mut builder, vm_page_addr(0));
+    let _ = builder.vm_load(page0_addr, IntWidth::W64);
+
+    let alias_addr = u64_const(&mut builder, vm_page_addr(alias_page));
+    let loaded = builder.vm_load(alias_addr, IntWidth::W64);
+    builder.store_x_reg::<0>(loaded);
+
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[
+            (0, MemProt::READ | MemProt::WRITE),
+            (alias_page, MemProt::WRITE),
+        ],
+        |page, offset| tlb_collision_byte(page, offset, alias_page),
+    );
+
+    let mut state = ProcessorState::initial();
+    state.x_registers[0] = 0x1111_2222_3333_4444;
+
+    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_memory_trap(code);
+    assert_eq!(state.x_registers[0], 0x1111_2222_3333_4444);
+}
+
+#[test]
+fn vm_tlb_collision_store_permission_check_uses_colliding_target_page() {
+    let mut builder = ExecIrBuilder::default();
+    let alias_page = TLB_SIZE;
+
+    let page0_addr = u64_const(&mut builder, vm_page_addr(0));
+    let page0_loaded = builder.vm_load(page0_addr, IntWidth::W64);
+    builder.store_x_reg::<0>(page0_loaded);
+
+    let alias_addr = u64_const(&mut builder, vm_page_addr(alias_page));
+    let alias_value = builder.iconst(IConst::u64(0xaaaa_bbbb_cccc_dddd));
+    builder.vm_store(alias_addr, alias_value);
+
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[
+            (0, MemProt::READ | MemProt::WRITE),
+            (alias_page, MemProt::READ),
+        ],
+        |page, offset| tlb_collision_byte(page, offset, alias_page),
+    );
+
+    let mut state = ProcessorState::initial();
+
+    let page0_before = fixture.mmu.load64_le(vm_page_addr(0)).unwrap();
+    let alias_before = fixture.mmu.load64_le(vm_page_addr(alias_page)).unwrap();
+
+    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
+
+    assert_memory_trap(code);
+    assert_eq!(
+        fixture.mmu.load64_le(vm_page_addr(0)).unwrap(),
+        page0_before
+    );
+    assert_eq!(
+        fixture.mmu.load64_le(vm_page_addr(alias_page)).unwrap(),
+        alias_before,
+    );
+}
+
+#[test]
+fn vm_tlb_hit_load_uses_page_number_not_zero_for_page1_offset0() {
     let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
+    let _ = builder.vm_load(addr, IntWidth::W64);
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
@@ -451,10 +688,12 @@ fn vm_fast_path_load_uses_page_number_not_zero_for_page1_offset0() {
 }
 
 #[test]
-fn vm_fast_path_store_uses_page_number_not_zero_for_page1_offset0() {
+fn vm_tlb_hit_store_uses_page_number_not_zero_for_page1_offset0() {
     let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
+    let warm_value = builder.iconst(IConst::u64(0x1111_2222_3333_4444));
+    builder.vm_store(addr, warm_value);
     let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
     builder.vm_store(addr, value);
 
@@ -468,78 +707,6 @@ fn vm_fast_path_store_uses_page_number_not_zero_for_page1_offset0() {
         fixture.mmu.load64_le(vm_page_addr(1)).unwrap(),
         0xfeed_face_cafe_beef,
     );
-}
-
-#[test]
-fn vm_fast_path_load_uses_page_number_not_page_offset_for_nonzero_page_nonzero_offset() {
-    let mut builder = ExecIrBuilder::default();
-
-    let start = PAGE_SIZE.strict_mul(2).strict_add(24);
-    let addr = u64_const(&mut builder, u64::try_from(start).unwrap());
-    let loaded = builder.vm_load(addr, IntWidth::W64);
-    builder.store_x_reg::<0>(loaded);
-
-    // This makes the old bug deterministic:
-    // correct page-table index is 2, but the broken index would be 24.
-    let fixture = VmFixture::with_bytes(32, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
-    let mut state = ProcessorState::initial();
-
-    run_success_with_mmu(builder, &mut state, &fixture.mmu);
-
-    assert_eq!(
-        state.x_registers[0],
-        u64::from_le_bytes(vm_page_tagged_array::<8>(start)),
-    );
-
-    assert_ne!(
-        state.x_registers[0],
-        u64::from_le_bytes(vm_page_tagged_array::<8>(24 * PAGE_SIZE + 24)),
-        "this would mean the fast path loaded from page table entry 24 instead of entry 2",
-    );
-}
-
-#[test]
-fn vm_fast_path_load_permission_check_uses_target_page_not_offset_page() {
-    let mut builder = ExecIrBuilder::default();
-
-    let addr = u64_const(&mut builder, vm_page_addr(1));
-    let loaded = builder.vm_load(addr, IntWidth::W64);
-    builder.store_x_reg::<0>(loaded);
-
-    let fixture = VmFixture::with_page_protections_and_bytes(
-        &[MemProt::READ | MemProt::WRITE, MemProt::WRITE],
-        vm_page_tagged_byte,
-    );
-
-    let mut state = ProcessorState::initial();
-    state.x_registers[0] = 0x1111_2222_3333_4444;
-
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
-
-    assert_memory_trap(code);
-    assert_eq!(state.x_registers[0], 0x1111_2222_3333_4444);
-}
-
-#[test]
-fn vm_fast_path_store_permission_check_uses_target_page_not_offset_page() {
-    let mut builder = ExecIrBuilder::default();
-
-    let addr = u64_const(&mut builder, vm_page_addr(1));
-    let value = builder.iconst(IConst::u64(0xfeed_face_cafe_beef));
-    builder.vm_store(addr, value);
-
-    let fixture = VmFixture::with_page_protections_and_bytes(
-        &[MemProt::READ | MemProt::WRITE, MemProt::READ],
-        |_| 0,
-    );
-
-    let mut state = ProcessorState::initial();
-    let code = run_with_mmu(builder, &mut state, &fixture.mmu);
-
-    assert_memory_trap(code);
-
-    assert_eq!(fixture.mmu.load64_le(vm_page_addr(0)).unwrap(), 0);
-    assert_eq!(fixture.mmu.load64_le(vm_page_addr(1)).unwrap(), 0);
 }
 
 #[test]
@@ -928,14 +1095,17 @@ fn vm_store_then_load_same_unaligned_address_in_same_ir_sees_new_value_fallback_
 }
 
 #[test]
-fn vm_load_fast_path_traps_when_page_number_equals_page_count() {
+fn vm_load_traps_when_tlb_miss_fallback_reports_unmapped_page() {
     let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let fixture = VmFixture::with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[(0, MemProt::READ | MemProt::WRITE)],
+        |page, offset| tlb_collision_byte(page, offset, usize::MAX),
+    );
     let mut state = ProcessorState::initial();
     state.x_registers[0] = 0xaaaa_bbbb_cccc_dddd;
 
@@ -946,20 +1116,33 @@ fn vm_load_fast_path_traps_when_page_number_equals_page_count() {
 }
 
 #[test]
-fn vm_store_fast_path_traps_when_page_number_equals_page_count() {
+fn vm_store_traps_when_tlb_miss_fallback_reports_unmapped_page() {
     let mut builder = ExecIrBuilder::default();
 
     let addr = u64_const(&mut builder, vm_page_addr(1));
     let value = builder.iconst(IConst::u64(0x0123_4567_89ab_cdef));
     builder.vm_store(addr, value);
 
-    let fixture = VmFixture::new(1, MemProt::READ | MemProt::WRITE);
+    let fixture = SparseVmFixture::with_mapped_pages_and_bytes(
+        &[(0, MemProt::READ | MemProt::WRITE)],
+        |_, _| 0,
+    );
     let mut state = ProcessorState::initial();
 
     let code = run_with_mmu(builder, &mut state, &fixture.mmu);
 
     assert_memory_trap(code);
     assert_eq!(fixture.mmu.load64_le(0).unwrap(), 0);
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn tlb_collision_byte(page: usize, offset: usize, alias_page: usize) -> u8 {
+    let base = if page == alias_page { 0xa0u8 } else { 0x10u8 };
+    base.wrapping_add(offset as u8)
+}
+
+fn tlb_collision_array<const N: usize>(page: usize, start: usize, alias_page: usize) -> [u8; N] {
+    std::array::from_fn(|i| tlb_collision_byte(page, start.wrapping_add(i), alias_page))
 }
 
 #[test]

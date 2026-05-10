@@ -1,4 +1,4 @@
-use crate::as_ffi::AsFFI;
+use crate::internal_traits::AsFFI;
 use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
 

@@ -1,14 +1,11 @@
 use crate::convert::u64_to_usize;
+use bytemuck::Zeroable;
 use std::hint::cold_path;
+use std::mem::MaybeUninit;
 use std::num::NonZero;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-
-pub const PAGE_SIZE_U64: u64 = 4096;
-pub const PAGE_SIZE: usize = u64_to_usize(PAGE_SIZE_U64).unwrap();
-
-pub const CACHE_LINE_SIZE_U64: u64 = 64;
-pub const CACHE_LINE_SIZE: usize = u64_to_usize(CACHE_LINE_SIZE_U64).unwrap();
 
 const fn compue_shift(power_of_2: u64) -> u8 {
     let power_of_2 = NonZero::new(power_of_2).unwrap();
@@ -18,10 +15,21 @@ const fn compue_shift(power_of_2: u64) -> u8 {
     bits as u8
 }
 
+const fn compute_mask(size: u64) -> u64 {
+    assert!(size.is_power_of_two());
+    size.strict_sub(1)
+}
+
+pub const PAGE_SIZE_U64: u64 = 4096;
+pub const PAGE_SIZE: usize = u64_to_usize(PAGE_SIZE_U64).unwrap();
+
+pub const CACHE_LINE_SIZE_U64: u64 = 64;
+pub const CACHE_LINE_SIZE: usize = u64_to_usize(CACHE_LINE_SIZE_U64).unwrap();
+
 pub const PAGE_SHIFT: u8 = compue_shift(PAGE_SIZE_U64);
 pub const CACHE_LINE_SHIFT: u8 = compue_shift(CACHE_LINE_SIZE_U64);
 
-pub const PAGE_OFFSET_MASK: u64 = PAGE_SIZE_U64.strict_sub(1);
+pub const PAGE_OFFSET_MASK: u64 = compute_mask(PAGE_SIZE_U64);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,6 +38,17 @@ bitflags::bitflags! {
         const READ       = 0b0001;
         const WRITE      = 0b0010;
         const EXECUTE    = 0b0100;
+    }
+}
+
+impl MemProt {
+    pub fn into_cannon(self) -> Self {
+        self & Self::all()
+    }
+
+    #[inline(always)]
+    fn assert_cannon(self) {
+        debug_assert!((self & Self::all()) == self)
     }
 }
 
@@ -94,8 +113,11 @@ impl Page {
         insn_dirty: AtomicBool::new(false),
     };
 
+    /// # Safety
+    /// `memory_protections` must only contain the bits found in `MemProt::all()`
     #[inline(always)]
-    pub fn mapped(ptr: NonNull<AtomicU8>, memory_protections: MemProt) -> Self {
+    pub unsafe fn mapped(ptr: NonNull<AtomicU8>, memory_protections: MemProt) -> Self {
+        memory_protections.assert_cannon();
         Self {
             ptr: Some(ptr),
             mem_prot: memory_protections,
@@ -123,8 +145,10 @@ impl Page {
 
     /// # Safety
     /// `self` must be mapped
+    /// `memory_protections` must only have the bits in `MemProt::all()` set
     pub unsafe fn mem_protect(&mut self, memory_protections: MemProt) {
         debug_assert!(self.is_mapped());
+        memory_protections.assert_cannon();
 
         let old_prot = self.mem_prot;
         let new_prot = memory_protections;
@@ -195,6 +219,11 @@ impl Page {
     }
 }
 
+// Safety: Page provides no way to read any pointers
+//         and any user of Page should only do atomic access
+unsafe impl Send for Page {}
+unsafe impl Sync for Page {}
+
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct HostPointer(pub NonNull<AtomicU8>);
@@ -226,5 +255,93 @@ impl PagePointer {
         let start = self.0;
         let end = HostPointer(unsafe { start.0.add(PAGE_SIZE) });
         start..end
+    }
+}
+
+#[derive(Clone)]
+pub struct TlbIdentifierToken(Arc<MaybeUninit<u8>>);
+
+impl TlbIdentifierToken {
+    pub fn new_token() -> Self {
+        // note we use a byte to make absoulely sure that we are getting a new
+        // `Arc` and that this isn't some cached ZST Arc
+        Self(Arc::<u8>::new_uninit())
+    }
+
+    pub fn is_same_tlb(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+const _: () = {
+    assert!(
+        (MemProt::all().bits() as u64 & !PAGE_OFFSET_MASK) == 0,
+        "MemProt bits must fit in the low page-alignment bits"
+    );
+};
+
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Copy, Clone)]
+#[repr(transparent)]
+pub struct PageNumber(pub u64);
+
+/// # Safety
+///
+/// if `tagged_page_ptr` is `Some`
+/// then `insn_dirty_ptr` must also be `Some`
+#[derive(Zeroable)]
+pub struct TlbEntry {
+    pub virtual_page_number: PageNumber,
+    pub generation: u64,
+    pub tagged_page_ptr: Option<NonNull<AtomicU8>>,
+    pub insn_dirty_ptr: Option<NonNull<AtomicBool>>,
+}
+
+impl TlbEntry {
+    /// # Safety
+    ///
+    /// `page` must be mapped
+    pub unsafe fn update_entry(
+        &mut self,
+        new_generation: NonZero<u64>,
+        new_page_number: PageNumber,
+        page: &Page,
+    ) {
+        let Self {
+            virtual_page_number,
+            generation,
+            tagged_page_ptr,
+            insn_dirty_ptr,
+        } = self;
+
+        let tagged_ptr = unsafe {
+            page.ptr
+                .unwrap_unchecked()
+                .map_addr(|addr| addr | page.mem_prot.bits() as usize)
+        };
+        let new_insn_dirty_ptr = NonNull::from_ref(&page.insn_dirty);
+
+        *tagged_page_ptr = Some(tagged_ptr);
+        *insn_dirty_ptr = Some(new_insn_dirty_ptr);
+        *generation = new_generation.get();
+        *virtual_page_number = new_page_number;
+    }
+}
+
+pub const TLB_SIZE_U64: u64 = 2048;
+pub const TLB_SIZE: usize = u64_to_usize(TLB_SIZE_U64).unwrap();
+pub const TLB_MASK: u64 = compute_mask(TLB_SIZE_U64);
+
+#[derive(Zeroable)]
+pub struct Tlb {
+    entries: [TlbEntry; TLB_SIZE],
+}
+
+impl Tlb {
+    pub fn new_boxed() -> Box<Self> {
+        bytemuck::allocation::zeroed_box()
+    }
+
+    pub fn entries(&mut self) -> *mut [TlbEntry; TLB_SIZE] {
+        &raw mut self.entries
     }
 }
