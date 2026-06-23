@@ -13,3 +13,16 @@ impl Drop for AbortGuard {
         abort()
     }
 }
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __panic_abort {
+    ($($arg:tt)*) => {{
+        let _abort_guard = $crate::abort::AbortGuard(());
+        panic!($($arg)*)
+    }};
+}
+
+/// panic without unwinding
+#[doc(inline)]
+pub use __panic_abort as panic_abort;

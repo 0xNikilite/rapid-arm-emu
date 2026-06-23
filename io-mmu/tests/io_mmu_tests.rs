@@ -2,10 +2,11 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 use emu_abi::convert::usize_to_u64;
-use emu_abi::internal_traits::{CpuFabricPrivate, ICache, InitInPlace};
+use emu_abi::internal_traits::InitInPlace;
 use emu_abi::memory::{MemProt, PAGE_SIZE, PAGE_SIZE_U64, PageNumber, PagePointer, Tlb};
 use io_mmu::NoCache;
 use io_mmu::cpu_fabric::CpuFabric;
+use io_mmu::icache::ICache;
 use parking_lot::Mutex;
 use std::mem::MaybeUninit;
 use std::num::NonZero;
@@ -80,7 +81,9 @@ fn iommu_with_bytes(pages: usize, protections: MemProt, byte: impl FnMut(u64) ->
     let size_u64 = u64::try_from(size).expect("requeted pages can't fit in 64 bti address space");
 
     let mut mmu = IoMMU::new(CpuFabric::new());
-    mmu.map(start, size_u64, protections).unwrap();
+    let lazy = false;
+    let shared = true;
+    mmu.map(start, size_u64, lazy, shared, protections).unwrap();
     write_pages_to_new_mmu(&mmu, start, size, byte);
     mmu
 }
@@ -93,7 +96,9 @@ fn iommu_with_page_protections_and_bytes(
 
     let mut mmu = IoMMU::new(CpuFabric::new());
     for (page, protections) in protections.iter().copied().enumerate() {
-        mmu.map(page_addr(page), PAGE_SIZE_U64, protections)
+        let lazy = false;
+        let shared = true;
+        mmu.map(page_addr(page), PAGE_SIZE_U64, lazy, shared, protections)
             .unwrap();
     }
 
@@ -122,7 +127,7 @@ fn read_array<const N: usize>(mmu: &IoMMU, vaddr: u64) -> [u8; N] {
 }
 
 fn is_dirty(mmu: &IoMMU, page: usize) -> bool {
-    mmu.flush_dirty_pages();
+    mmu.flush_async();
 
     const BASE_PAGE: u64 = {
         assert!(BASE.is_multiple_of(PAGE_SIZE_U64));
@@ -239,10 +244,14 @@ fn map_memory_rejects_unaligned_base_size_ptr_and_overflow() {
     for rejected_combination in rejected_combinations {
         let (base, allocation_size) = rejected_combination;
         let prot = MemProt::READ;
-        assert!(mmu.map(base, allocation_size, prot).is_err());
+
+        // cow because we don't need to access this
+        let cow = true;
+        let shared = false;
+        assert!(mmu.map(base, allocation_size, cow, shared, prot).is_err());
         let res = unsafe {
             assert!(allocation_size <= total_allocated_bytes);
-            mmu.map_shared(base, allocation_size, ptr, prot)
+            mmu.map_extern(base, allocation_size, ptr, cow, shared, prot)
         };
 
         assert!(res.is_err())
@@ -257,7 +266,16 @@ fn map_memory_rejects_mapping_unaligned() {
     let mut manager = AllocManager::new(pages);
     let ptr = manager.get_mem().as_mut_ptr();
     unsafe {
-        let res = mmu.map_shared(BASE, PAGE_SIZE_U64, ptr.byte_add(1), MemProt::NONE);
+        let readonly = false;
+        let shared = true;
+        let res = mmu.map_extern(
+            BASE,
+            PAGE_SIZE_U64,
+            ptr.byte_add(1),
+            readonly,
+            shared,
+            MemProt::NONE,
+        );
         assert!(res.is_err())
     }
 }
@@ -267,7 +285,16 @@ fn map_memory_rejects_mapping_unaligned() {
 fn map_memory_rejects_mapping_null() {
     let mut mmu = IoMMU::new(CpuFabric::new());
     unsafe {
-        let res = mmu.map_shared(BASE, PAGE_SIZE_U64, std::ptr::null_mut(), MemProt::NONE);
+        let readonly = true;
+        let shared = false;
+        let res = mmu.map_extern(
+            BASE,
+            PAGE_SIZE_U64,
+            std::ptr::null_mut(),
+            readonly,
+            shared,
+            MemProt::NONE,
+        );
         assert!(res.is_err())
     }
 }
@@ -288,9 +315,18 @@ fn nonzero_base_maps_only_requested_page() {
     let mut mmu = IoMMU::new(CpuFabric::new());
     let base = page_addr(2);
 
+    let readonly = false;
+    let shared = false;
     unsafe {
-        mmu.map_shared(base, PAGE_SIZE_U64, slice.as_mut_ptr(), MemProt::READ)
-            .unwrap();
+        mmu.map_extern(
+            base,
+            PAGE_SIZE_U64,
+            slice.as_mut_ptr(),
+            readonly,
+            shared,
+            MemProt::READ,
+        )
+        .unwrap();
     }
 
     TLB.with_borrow_mut(|tlb| {
@@ -755,13 +791,27 @@ fn bug_cross_page_scalar_store_should_mark_touched_executable_pages_dirty() {
 fn sparse_fixture_with_hole() -> IoMMU {
     let mut mmu = IoMMU::new(CpuFabric::new());
 
-    mmu.map(page_addr(0), PAGE_SIZE_U64, MemProt::READ | MemProt::WRITE)
-        .unwrap();
+    let lazy = false;
+    let shared = false;
+    mmu.map(
+        page_addr(0),
+        PAGE_SIZE_U64,
+        lazy,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
 
     // Intentionally skip page 1.
 
-    mmu.map(page_addr(2), PAGE_SIZE_U64, MemProt::READ | MemProt::WRITE)
-        .unwrap();
+    mmu.map(
+        page_addr(2),
+        PAGE_SIZE_U64,
+        lazy,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
 
     mmu
 }
@@ -917,8 +967,16 @@ fn unmap_memory_then_remap_restores_access() {
         assert!(mmu.load_byte(&mut *tlb, BASE).is_err());
     });
 
-    mmu.map(BASE, PAGE_SIZE_U64, MemProt::READ | MemProt::WRITE)
-        .unwrap();
+    let lazy = false;
+    let shared = false;
+    mmu.map(
+        BASE,
+        PAGE_SIZE_U64,
+        lazy,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
 
     TLB.with_borrow_mut(|tlb| {
         mmu.store_byte(&mut *tlb, BASE, 0xbb).unwrap();
@@ -1265,9 +1323,13 @@ fn map_and_access_last_possible_page() {
     let base = u64::MAX.strict_sub(PAGE_SIZE_U64.strict_sub(1));
 
     let mut mmu = IoMMU::new(CpuFabric::new());
+    let lazy = false;
+    let shared = false;
     mmu.map(
         base,
         PAGE_SIZE_U64,
+        lazy,
+        shared,
         MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
     )
     .unwrap();
@@ -1292,5 +1354,289 @@ fn map_and_access_last_possible_page() {
         mmu.store32_le(&mut *tlb, last_word_addr, to_store).unwrap();
         let found_word: Word = mmu.fetch_aarch64(&mut *tlb, last_word_addr).unwrap();
         assert_eq!(found_word, to_store)
+    });
+}
+
+#[test]
+fn dma_file_faults_in_written_data() {
+    use std::io::Write;
+
+    let mut file = tempfile::tempfile().unwrap();
+    let expected = pattern_array::<PAGE_SIZE>(BASE);
+    file.write_all(&expected).unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = false;
+    mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
+        .unwrap();
+
+    let got = read_array::<PAGE_SIZE>(&mmu, BASE);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn dma_file_faults_in_across_multiple_pages() {
+    use std::io::Write;
+
+    let pages = 3;
+    let mut file = tempfile::tempfile().unwrap();
+    for p in 0..pages {
+        file.write_all(&pattern_array::<PAGE_SIZE>(page_addr(p)))
+            .unwrap();
+    }
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let size = PAGE_SIZE_U64.strict_mul(pages as u64);
+    let shared = false;
+    mmu.map_device(BASE, size, file, shared, MemProt::READ)
+        .unwrap();
+
+    for p in 0..pages {
+        let addr = page_addr(p);
+        assert_eq!(
+            read_array::<PAGE_SIZE>(&mmu, addr),
+            pattern_array::<PAGE_SIZE>(addr),
+            "page {p} mismatch"
+        );
+    }
+}
+
+#[test]
+fn dma_file_faults_on_read_past_eof() {
+    let file = tempfile::tempfile().unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = false;
+    mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
+        .unwrap();
+
+    TLB.with_borrow_mut(|tlb| {
+        assert!(mmu.load_byte(&mut *tlb, BASE).is_err());
+    });
+}
+
+#[test]
+fn dma_file_partial_page_zero_fills_tail() {
+    use std::io::Write;
+
+    const WRITTEN: usize = 37;
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&pattern_array::<WRITTEN>(BASE)).unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = false;
+    mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
+        .unwrap();
+
+    let got = read_array::<PAGE_SIZE>(&mmu, BASE);
+    assert_eq!(got[..WRITTEN], pattern_array::<WRITTEN>(BASE));
+    assert!(got[WRITTEN..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn dma_file_store_then_load_roundtrips() {
+    use std::io::Write;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&[0u8; PAGE_SIZE]).unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = false;
+    mmu.map_device(
+        BASE,
+        PAGE_SIZE_U64,
+        file,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
+
+    TLB.with_borrow_mut(|tlb| {
+        mmu.store_byte(&mut *tlb, BASE, 0xab).unwrap();
+        mmu.store_byte(&mut *tlb, BASE.strict_add(PAGE_SIZE_U64 - 1), 0xcd)
+            .unwrap();
+
+        assert_eq!(mmu.load_byte(&mut *tlb, BASE).unwrap(), 0xab);
+        assert_eq!(
+            mmu.load_byte(&mut *tlb, BASE.strict_add(PAGE_SIZE_U64 - 1))
+                .unwrap(),
+            0xcd
+        );
+        assert_eq!(mmu.load_byte(&mut *tlb, BASE.strict_add(1)).unwrap(), 0);
+    });
+}
+
+#[test]
+fn dma_file_respects_protections() {
+    use std::io::Write;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&[0u8; PAGE_SIZE]).unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = false;
+    mmu.map_device(BASE, PAGE_SIZE_U64, file, shared, MemProt::READ)
+        .unwrap();
+
+    TLB.with_borrow_mut(|tlb| {
+        assert!(mmu.load_byte(&mut *tlb, BASE).is_ok());
+        assert!(mmu.store_byte(&mut *tlb, BASE, 0xaa).is_err());
+    });
+}
+
+#[test]
+fn dma_shared_flush_writes_dirty_pages_to_device() {
+    use std::io::{Read, Seek, Write};
+
+    let mut tmp = tempfile::tempfile().unwrap();
+    tmp.write_all(&[0u8; PAGE_SIZE]).unwrap();
+    let device = tmp.try_clone().unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = true;
+    mmu.map_device(
+        BASE,
+        PAGE_SIZE_U64,
+        device,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
+
+    let new_page = [0xab; PAGE_SIZE];
+
+    TLB.with_borrow_mut(|tlb| mmu.store(&mut *tlb, BASE, &new_page).unwrap());
+
+    mmu.flush().unwrap();
+
+    let mut buf = [0u8; PAGE_SIZE];
+    tmp.seek(std::io::SeekFrom::Start(0)).unwrap();
+    tmp.read_exact(&mut buf).unwrap();
+    assert_eq!(buf, new_page);
+}
+
+#[test]
+fn dma_exclusive_flush_does_not_write_to_device() {
+    use std::io::{Read, Seek, Write};
+
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    tmp.write_all(&[0u8; PAGE_SIZE]).unwrap();
+    let device = tmp.reopen().unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = false;
+    mmu.map_device(
+        BASE,
+        PAGE_SIZE_U64,
+        device,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
+
+    TLB.with_borrow_mut(|tlb| mmu.store_byte(&mut *tlb, BASE, 0xab).unwrap());
+
+    mmu.flush().unwrap();
+
+    let mut buf = vec![0u8; PAGE_SIZE];
+    tmp.seek(std::io::SeekFrom::Start(0)).unwrap();
+    tmp.read_exact(&mut buf).unwrap();
+    assert_eq!(
+        buf[0], 0,
+        "exclusive mapping should not write back to device"
+    );
+}
+
+#[test]
+fn dma_shared_fork_shares_pages_if_faulted_before() {
+    use std::io::Write;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&[0u8; PAGE_SIZE]).unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = true;
+    mmu.map_device(
+        BASE,
+        PAGE_SIZE_U64,
+        file,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
+
+    // fault in before fork
+    TLB.with_borrow_mut(|tlb| {
+        assert_eq!(mmu.load_byte(&mut *tlb, BASE).unwrap(), 0);
+    });
+
+    let child = mmu.fork();
+
+    TLB.with_borrow_mut(|tlb| {
+        mmu.store_byte(&mut *tlb, BASE, 0xab).unwrap();
+        assert_eq!(child.load_byte(&mut *tlb, BASE).unwrap(), 0xab);
+    });
+}
+
+#[test]
+fn dma_shared_fork_shares_pages_if_faulted_after() {
+    use std::io::Write;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&[0u8; PAGE_SIZE]).unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = true;
+    mmu.map_device(
+        BASE,
+        PAGE_SIZE_U64,
+        file,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
+
+    let child = mmu.fork();
+
+    TLB.with_borrow_mut(|tlb| {
+        mmu.store_byte(&mut *tlb, BASE, 0xab).unwrap();
+        assert_eq!(child.load_byte(&mut *tlb, BASE).unwrap(), 0xab);
+    });
+}
+
+#[test]
+fn dma_exclusive_fork_does_not_share_pages() {
+    use std::io::Write;
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&[0u8; PAGE_SIZE]).unwrap();
+
+    let mut mmu = IoMMU::new(CpuFabric::new());
+    let shared = false;
+    mmu.map_device(
+        BASE,
+        PAGE_SIZE_U64,
+        file,
+        shared,
+        MemProt::READ | MemProt::WRITE,
+    )
+    .unwrap();
+
+    TLB.with_borrow_mut(|tlb| {
+        mmu.store_byte(&mut *tlb, BASE, 0xaa).unwrap();
+    });
+
+    let mut child = mmu.fork();
+
+    mmu.copy_all_cow_pages();
+    child.copy_all_cow_pages();
+
+    TLB.with_borrow_mut(|tlb| {
+        mmu.store_byte(&mut *tlb, BASE, 0xbb).unwrap();
+        assert_eq!(
+            child.load_byte(&mut *tlb, BASE).unwrap(),
+            0xaa,
+            "exclusive fork should COW: child must not see parent's post-fork write"
+        );
     });
 }

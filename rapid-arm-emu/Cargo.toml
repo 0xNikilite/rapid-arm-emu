@@ -13,4 +13,3 @@ emu-abi = { workspace = true }
 io-mmu = { workspace = true }
 exec-ir = { workspace = true }
 parking_lot = { workspace = true }
-slab = "0.4.12"

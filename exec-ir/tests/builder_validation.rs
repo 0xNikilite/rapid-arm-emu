@@ -1,5 +1,5 @@
 use crate::helper::u64_const;
-use emu_abi::processor_state::X_REGISTER_COUNT;
+use emu_abi::exec_state::X_REGISTER_COUNT;
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth, Terminator};
 
 mod helper;
@@ -12,7 +12,7 @@ fn builder_rejects_arithmetic_width_mismatch() {
     let wide = builder.iconst(IConst::u64(1));
     let narrow = builder.iconst(IConst::u32(1));
 
-    let _ = builder.add(wide, narrow);
+    let _ = builder.iadd(wide, narrow);
 }
 
 #[test]

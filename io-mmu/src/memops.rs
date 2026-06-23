@@ -55,13 +55,23 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 // }
 
 #[inline(always)]
+pub(crate) unsafe fn load64_ne_aligned(ptr: *const AtomicU8) -> u64 {
+    unsafe { (*ptr.cast::<AtomicU64>()).load(Ordering::Relaxed) }
+}
+
+#[inline(always)]
 pub(crate) unsafe fn load64_le_aligned(ptr: *const AtomicU8) -> u64 {
-    unsafe { (*ptr.cast::<AtomicU64>()).load(Ordering::Relaxed).to_le() }
+    unsafe { load64_ne_aligned(ptr).to_le() }
+}
+
+#[inline(always)]
+pub(crate) unsafe fn store64_ne_aligned(ptr: *const AtomicU8, value: u64) {
+    unsafe { (*ptr.cast::<AtomicU64>()).store(value, Ordering::Relaxed) }
 }
 
 #[inline(always)]
 pub(crate) unsafe fn store64_le_aligned(ptr: *const AtomicU8, value: u64) {
-    unsafe { (*ptr.cast::<AtomicU64>()).store(value.to_le(), Ordering::Relaxed) }
+    unsafe { store64_ne_aligned(ptr, value.to_le()) }
 }
 
 #[inline(always)]

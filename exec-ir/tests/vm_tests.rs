@@ -1,17 +1,18 @@
 use crate::helper::{
     TLB, call_compiled_full, compile, run_with_mmu, store_int_equals_as_x_reg, u64_const,
 };
+use emu_abi::exec_state::ExecState;
 use emu_abi::halt_reason::HaltReason;
-use emu_abi::internal_traits::{CpuFabricPrivate, ICache, InitInPlace};
+use emu_abi::internal_traits::InitInPlace;
 use emu_abi::memory::{MemProt, PAGE_SIZE, PAGE_SIZE_U64, PagePointer, TLB_SIZE};
-use emu_abi::processor_state::ProcessorState;
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
 use io_mmu::NoCache;
 use io_mmu::cpu_fabric::CpuFabric;
-use std::cell::RefCell;
+use io_mmu::icache::ICache;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
 use std::num::NonZero;
+use std::sync::Mutex;
 
 mod helper;
 
@@ -30,17 +31,17 @@ fn vm_pattern_array<const N: usize>(start: usize) -> [u8; N] {
     std::array::from_fn(|i| vm_pattern_byte(start.wrapping_add(i)))
 }
 
-struct ICacheSink(RefCell<HashSet<PagePointer>>);
+struct ICacheSink(Mutex<HashSet<PagePointer>>);
 
 impl ICache for ICacheSink {
     fn invalidate(&self, page: PagePointer) {
-        self.0.borrow_mut().insert(page);
+        self.0.lock().unwrap().insert(page);
     }
 }
 
 unsafe impl InitInPlace for ICacheSink {
     fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
-        this.write(ICacheSink(RefCell::new(HashSet::new())))
+        this.write(ICacheSink(Mutex::new(HashSet::new())))
     }
 }
 
@@ -57,9 +58,12 @@ fn iommu_with_sparse_page_protections_and_bytes(
 
     let mut needs_flush = false;
 
+    // non-lazy shared anon memory is almost always the fastest memory around
+    let lazy = false;
+    let shared = true;
     for &(page, protections) in protections {
         let base = vm_page_addr(page);
-        mmu.map(base, page_size, protections).unwrap();
+        mmu.map(base, page_size, lazy, shared, protections).unwrap();
 
         let mut needs_store = false;
         let page = std::array::from_fn::<u8, PAGE_SIZE, _>(|i| {
@@ -72,15 +76,15 @@ fn iommu_with_sparse_page_protections_and_bytes(
             TLB.with_borrow_mut(|tlb| {
                 mmu.store_force(tlb, base, &page).unwrap();
             });
-            if protections.contains(MemProt::EXECUTE) {
+            if protections.contains_any(MemProt::EXECUTE) {
                 needs_flush = true;
             }
         }
     }
 
     if needs_flush {
-        mmu.flush_dirty_pages();
-        mmu.get_fabric().icache().0.borrow_mut().clear();
+        mmu.flush_async();
+        mmu.get_fabric().icache().0.lock().unwrap().clear();
     }
 
     mmu
@@ -105,11 +109,7 @@ fn new_iommu(pages: usize, protections: MemProt) -> IoMMU {
     iommu_with_bytes(pages, protections, |_| 0)
 }
 
-fn run_success_with_mmu(
-    builder: ExecIrBuilder,
-    processor_state: &mut ProcessorState,
-    io_mmu: &IoMMU,
-) {
+fn run_success_with_mmu(builder: ExecIrBuilder, processor_state: &mut ExecState, io_mmu: &IoMMU) {
     assert_eq!(run_with_mmu(builder, processor_state, io_mmu), 0);
 }
 
@@ -132,7 +132,7 @@ fn vm_load64_reads_mapped_memory_after_tlb_miss() {
     builder.store_x_reg::<0>(loaded);
 
     let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -151,7 +151,7 @@ fn vm_store64_writes_mapped_memory_after_tlb_miss() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -171,7 +171,7 @@ fn vm_unaligned_load32_uses_iommu_fallback() {
     );
 
     let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -187,7 +187,7 @@ fn vm_unaligned_store32_uses_iommu_fallback() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -209,7 +209,7 @@ fn vm_cross_page_load64_uses_iommu_fallback() {
     );
 
     let mmu = iommu_with_bytes(2, MemProt::READ | MemProt::WRITE, vm_pattern_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -226,7 +226,7 @@ fn vm_cross_page_store64_uses_iommu_fallback() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -244,7 +244,7 @@ fn vm_load_traps_when_page_is_out_of_bounds() {
     let loaded = builder.vm_load(addr, IntWidth::W64);
     builder.store_x_reg::<0>(loaded);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 0xfeed_face;
 
     let mmu = IoMMU::new(CpuFabric::new());
@@ -263,7 +263,7 @@ fn vm_load_traps_on_missing_read_permission() {
     builder.store_x_reg::<0>(loaded);
 
     let mmu = new_iommu(1, MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 0xfeed_face;
 
     let code = run_with_mmu(builder, &mut state, &mmu);
@@ -283,7 +283,7 @@ fn vm_store_traps_on_missing_write_permission_and_does_not_modify_memory() {
     let mmu = iommu_with_bytes(1, MemProt::READ, vm_pattern_byte);
     let expected = u64::from_le_bytes(vm_pattern_array::<8>(8));
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     let code = run_with_mmu(builder, &mut state, &mmu);
     assert_memory_trap(code);
 
@@ -357,7 +357,7 @@ fn vm_aligned_fast_path_loads_all_widths_from_page0_nonzero_offsets() {
     builder.store_x_reg::<3>(value);
 
     let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -391,7 +391,7 @@ fn vm_aligned_fast_path_stores_all_widths_to_page0_nonzero_offsets() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -415,7 +415,7 @@ fn vm_tlb_hit_load_uses_cached_entry_for_same_page_and_offset() {
     builder.store_x_reg::<0>(loaded);
 
     let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -446,7 +446,7 @@ fn vm_tlb_collision_load_does_not_reuse_different_virtual_page_entry() {
         ],
         |page, offset| tlb_collision_byte(page, offset, alias_page),
     );
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -484,7 +484,7 @@ fn vm_tlb_collision_store_does_not_write_through_different_virtual_page_entry() 
         ],
         |_, _| 0,
     );
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -516,7 +516,7 @@ fn vm_tlb_collision_load_to_unmapped_page_traps_instead_of_reusing_old_entry() {
         &[(0, MemProt::READ | MemProt::WRITE)],
         |page, offset| tlb_collision_byte(page, offset, alias_page),
     );
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 0x1234_5678_9abc_def0;
 
     let code = run_with_mmu(builder, &mut state, &mmu);
@@ -543,7 +543,7 @@ fn vm_tlb_collision_store_to_unmapped_page_traps_instead_of_reusing_old_entry() 
         |page, offset| tlb_collision_byte(page, offset, alias_page),
     );
     let page0_before = TLB.with_borrow_mut(|tlb| mmu.load64_le(tlb, vm_page_addr(0)).unwrap());
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     let code = run_with_mmu(builder, &mut state, &mmu);
 
@@ -574,7 +574,7 @@ fn vm_tlb_collision_load_permission_check_uses_colliding_target_page() {
         |page, offset| tlb_collision_byte(page, offset, alias_page),
     );
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 0x1111_2222_3333_4444;
 
     let code = run_with_mmu(builder, &mut state, &mmu);
@@ -604,7 +604,7 @@ fn vm_tlb_collision_store_permission_check_uses_colliding_target_page() {
         |page, offset| tlb_collision_byte(page, offset, alias_page),
     );
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     let (page0_before, alias_before) = TLB.with_borrow_mut(|tlb| {
         let page0_before = mmu.load64_le(&mut *tlb, vm_page_addr(0)).unwrap();
@@ -638,7 +638,7 @@ fn vm_tlb_hit_load_uses_page_number_not_zero_for_page1_offset0() {
     builder.store_x_reg::<0>(loaded);
 
     let mmu = iommu_with_bytes(2, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -659,7 +659,7 @@ fn vm_tlb_hit_store_uses_page_number_not_zero_for_page1_offset0() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -700,7 +700,7 @@ fn vm_fast_path_load_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
     builder.store_x_reg::<2>(value);
 
     let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -723,7 +723,7 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
         builder.vm_store(addr, value);
 
         let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-        let mut state = ProcessorState::initial();
+        let mut state = ExecState::initial();
 
         run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -743,7 +743,7 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
         builder.vm_store(addr, value);
 
         let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-        let mut state = ProcessorState::initial();
+        let mut state = ExecState::initial();
 
         run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -763,7 +763,7 @@ fn vm_fast_path_store_at_exact_end_of_page_succeeds_for_w16_w32_and_w64() {
         builder.vm_store(addr, value);
 
         let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-        let mut state = ProcessorState::initial();
+        let mut state = ExecState::initial();
 
         run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -789,7 +789,7 @@ fn vm_byte_access_at_last_byte_of_page_uses_fast_path_and_succeeds() {
     builder.vm_store(addr, value);
 
     let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -812,7 +812,7 @@ fn vm_dynamic_load_can_take_fast_path_and_fallback_path_in_same_compiled_chunk()
     let compiled = compile(builder);
     let mmu = iommu_with_bytes(1, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
 
-    let mut aligned_state = ProcessorState::initial();
+    let mut aligned_state = ExecState::initial();
     aligned_state.x_registers[0] = 8;
     assert_eq!(
         call_compiled_full(
@@ -829,7 +829,7 @@ fn vm_dynamic_load_can_take_fast_path_and_fallback_path_in_same_compiled_chunk()
         u64::from_le_bytes(vm_page_tagged_array::<8>(8)),
     );
 
-    let mut unaligned_state = ProcessorState::initial();
+    let mut unaligned_state = ExecState::initial();
     unaligned_state.x_registers[0] = 3;
     assert_eq!(
         call_compiled_full(
@@ -858,7 +858,7 @@ fn vm_dynamic_store_can_take_fast_path_and_fallback_path_in_same_compiled_chunk(
     let compiled = compile(builder);
 
     let aligned_mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut aligned_state = ProcessorState::initial();
+    let mut aligned_state = ExecState::initial();
     aligned_state.x_registers[0] = 8;
     aligned_state.x_registers[1] = 0x1111_2222_3333_4444;
 
@@ -878,7 +878,7 @@ fn vm_dynamic_store_can_take_fast_path_and_fallback_path_in_same_compiled_chunk(
     );
 
     let fallback_mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut fallback_state = ProcessorState::initial();
+    let mut fallback_state = ExecState::initial();
     fallback_state.x_registers[0] = 3;
     fallback_state.x_registers[1] = 0xaaaa_bbbb_cccc_dddd;
 
@@ -912,8 +912,10 @@ fn vm_cross_page_load16_traps_when_second_page_lacks_read_permission() {
         vm_page_tagged_byte,
     );
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 0xdead_beef;
+
+    eprintln!("{:x?}", state.x_registers[0]);
 
     let code = run_with_mmu(builder, &mut state, &mmu);
 
@@ -947,7 +949,7 @@ fn vm_cross_page_store32_traps_when_second_page_lacks_write_and_does_not_partial
 
     let before = read_bytes();
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     let code = run_with_mmu(builder, &mut state, &mmu);
     assert_memory_trap(code);
 
@@ -965,7 +967,7 @@ fn vm_cross_page_load64_roundtrips_exact_little_endian_bytes() {
     builder.store_x_reg::<0>(loaded);
 
     let mmu = iommu_with_bytes(2, MemProt::READ | MemProt::WRITE, vm_page_tagged_byte);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -985,7 +987,7 @@ fn vm_cross_page_store64_roundtrips_exact_little_endian_bytes() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -1008,7 +1010,7 @@ fn vm_store_then_load_same_address_in_same_ir_sees_new_value_fast_path() {
     builder.store_x_reg::<0>(loaded);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -1028,7 +1030,7 @@ fn vm_store_then_load_same_unaligned_address_in_same_ir_sees_new_value_fallback_
     builder.store_x_reg::<0>(loaded);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -1048,7 +1050,7 @@ fn vm_load_traps_when_tlb_miss_fallback_reports_unmapped_page() {
         &[(0, MemProt::READ | MemProt::WRITE)],
         |page, offset| tlb_collision_byte(page, offset, usize::MAX),
     );
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 0xaaaa_bbbb_cccc_dddd;
 
     let code = run_with_mmu(builder, &mut state, &mmu);
@@ -1069,7 +1071,7 @@ fn vm_store_traps_when_tlb_miss_fallback_reports_unmapped_page() {
         &[(0, MemProt::READ | MemProt::WRITE)],
         |_, _| 0,
     );
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     let code = run_with_mmu(builder, &mut state, &mmu);
 
@@ -1088,8 +1090,8 @@ fn tlb_collision_array<const N: usize>(page: usize, start: usize, alias_page: us
 }
 
 fn drain_dirty_icache_pages(mmu: &IoMMU) -> usize {
-    mmu.flush_dirty_pages();
-    let lock = &mut *mmu.get_fabric().icache().0.borrow_mut();
+    mmu.flush_async();
+    let lock = &mut *mmu.get_fabric().icache().0.lock().unwrap();
     let count = lock.len();
     lock.clear();
     count
@@ -1104,7 +1106,7 @@ fn vm_store_to_non_executable_page_does_not_dirty_icache_page() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
@@ -1127,7 +1129,7 @@ fn vm_store_to_executable_page_dirties_icache_page() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
@@ -1159,7 +1161,7 @@ fn vm_load_from_executable_page_does_not_dirty_icache_page() {
         MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
         vm_pattern_byte,
     );
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
@@ -1189,7 +1191,7 @@ fn repeated_vm_stores_to_same_executable_page_report_one_dirty_page() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -1217,7 +1219,7 @@ fn vm_store_to_executable_page1_dirties_only_one_page() {
         MemProt::READ | MemProt::WRITE | MemProt::EXECUTE,
     ];
     let mmu = iommu_with_page_protections_and_bytes(&protections, |_| 0);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     run_success_with_mmu(builder, &mut state, &mmu);
 
@@ -1243,7 +1245,7 @@ fn vm_unaligned_store64_fallback_dirties_executable_icache_page() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(1, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 
@@ -1272,7 +1274,7 @@ fn vm_cross_page_store16_fallback_dirties_both_executable_icache_pages() {
     builder.vm_store(addr, value);
 
     let mmu = new_iommu(2, MemProt::READ | MemProt::WRITE | MemProt::EXECUTE);
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
 
     assert_eq!(drain_dirty_icache_pages(&mmu), 0);
 

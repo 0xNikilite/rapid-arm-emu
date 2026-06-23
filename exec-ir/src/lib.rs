@@ -2,13 +2,15 @@ use crate::arena::{Arena, ArenaSet, impl_storable};
 use crate::ffi_support::IoMmuStatus;
 use arrayvec::ArrayVec;
 use emu_abi::array_helper;
+use emu_abi::exec_state::{ExecState, PState, X_REGISTER_COUNT};
 use emu_abi::halt_reason::HaltReason;
-use emu_abi::internal_traits::ICache;
 use emu_abi::memory::{
-    MemProt, PAGE_OFFSET_MASK_U64, PAGE_SHIFT, PAGE_SIZE, TLB_MASK, Tlb, TlbEntry,
+    MemFlags, MemProt, PAGE_OFFSET_MASK_U64, PAGE_SHIFT, PAGE_SIZE, TLB_MASK, Tlb, TlbEntry,
 };
-use emu_abi::processor_state::{PState, ProcessorState, X_REGISTER_COUNT};
 use io_mmu::IoMMU;
+use io_mmu::cpu_fabric::exclusive_monitor::ReservationToken;
+use io_mmu::fault::MemoryFault;
+use io_mmu::icache::ICache;
 use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -19,6 +21,114 @@ mod arena;
 pub mod compiler;
 mod ffi_support;
 mod halt_check_pass;
+mod optimization_pass;
+
+// TODO move into trap bits
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum MemOp {
+    Read,
+    Write,
+    Rwm,
+}
+
+pub struct FFISafeMemoryFault {
+    was_real_memory_trap: bool,
+    has_bus_error: bool,
+    vaddr: u64,
+    mem_op: MemOp,
+    bus_error: MaybeUninit<anyhow::Error>,
+}
+
+impl Default for FFISafeMemoryFault {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FFISafeMemoryFault {
+    pub const fn new() -> Self {
+        const {
+            Self {
+                was_real_memory_trap: false,
+                has_bus_error: false,
+                vaddr: 0,
+                mem_op: MemOp::Read,
+                bus_error: MaybeUninit::uninit(),
+            }
+        }
+    }
+
+    fn drop_bus_error(&mut self) {
+        if self.has_bus_error {
+            self.has_bus_error = false;
+            unsafe { self.bus_error.assume_init_drop() }
+        }
+    }
+
+    fn take_bus_error(&mut self) -> Option<anyhow::Error> {
+        match self.has_bus_error {
+            true => {
+                self.has_bus_error = false;
+                Some(unsafe { self.bus_error.assume_init_read() })
+            }
+            false => None,
+        }
+    }
+
+    pub fn set_gp_fault(&mut self, vaddr: u64) {
+        self.was_real_memory_trap = true;
+        self.vaddr = vaddr;
+    }
+
+    pub fn set_bus_fault(&mut self, vaddr: u64, error: anyhow::Error) {
+        self.was_real_memory_trap = true;
+        self.vaddr = vaddr;
+
+        self.drop_bus_error();
+        self.bus_error.write(error);
+        self.has_bus_error = true;
+    }
+
+    pub fn take_memory_fault(&mut self) -> Option<(MemoryFault, MemOp)> {
+        if !self.was_real_memory_trap {
+            return None;
+        }
+
+        self.was_real_memory_trap = false;
+
+        let bus_error = self.take_bus_error();
+
+        let fault = match bus_error {
+            None => MemoryFault::general_protection(self.vaddr),
+            Some(bus_error) => MemoryFault::memory_bus(self.vaddr, bus_error),
+        };
+
+        Some((fault, self.mem_op))
+    }
+}
+
+impl Drop for FFISafeMemoryFault {
+    fn drop(&mut self) {
+        self.drop_bus_error();
+    }
+}
+
+pub struct ExecStateExtra {
+    _exclusive_monitor_reservation: Option<ReservationToken>,
+    pub mem_fault_metadata: FFISafeMemoryFault,
+}
+
+impl ExecStateExtra {
+    #[inline(always)]
+    pub const fn initial() -> Self {
+        const {
+            Self {
+                _exclusive_monitor_reservation: None,
+                mem_fault_metadata: FFISafeMemoryFault::new(),
+            }
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IntWidth {
@@ -54,17 +164,42 @@ impl IntWidth {
     }
 }
 
+macro_rules! define_alias_regions {
+    ($($name: ident),+ $(,)?) => {
+        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+        pub enum AliasRegion {
+            $($name),+
+        }
+
+        impl AliasRegion {
+            pub const COUNT: usize = <[Self]>::len(&[$(Self::$name),+]);
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$name),+];
+        }
+    };
+}
+
+define_alias_regions! {
+    ExecState,
+    ExecStateExtra,
+    Tlb,
+    HaltReason,
+    ReadOnly,
+    ScratchSpace,
+    VirtualMemory,
+    PageFlags,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Type {
     Int(IntWidth),
     Bool,
-    HostPtr,
+    HostPtr(AliasRegion),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LoadType {
     Int(IntWidth),
-    HostPtr,
+    HostPtr(AliasRegion),
 }
 
 impl Type {
@@ -89,11 +224,12 @@ struct SSAValueData {
 impl_storable! {
     SSAValueData as impl pub SSAValue;
     init: {
-        const ARG_PROCESSOR_STATE = SSAValueData { ty: Type::HostPtr };
-        const ARG_TLB_PTR = SSAValueData { ty: Type::HostPtr };
-        const ARG_IO_MMU_IDENT = SSAValueData { ty: Type::HostPtr };
-        const ARG_HALT_REASON_PTR = SSAValueData { ty: Type::HostPtr };
-        const ARG_IO_MMU = SSAValueData { ty: Type::HostPtr };
+        const ARG_EXEC_STATE = SSAValueData { ty: Arg::ExecState.ty() };
+        const ARG_EXEC_STATE_EXTRA = SSAValueData { ty: Arg::ExecStateExtra.ty() };
+        const ARG_TLB_PTR = SSAValueData { ty: Arg::Tlb.ty() };
+        const ARG_IO_MMU_IDENT = SSAValueData { ty: Arg::IoMMUIdentifier.ty() };
+        const ARG_HALT_REASON_PTR = SSAValueData { ty: Arg::HaltReasonPtr.ty() };
+        const ARG_IO_MMU = SSAValueData { ty: Arg::IoMMU.ty() };
     }
 }
 
@@ -110,7 +246,8 @@ impl_storable! {
 
 #[derive(Copy, Clone)]
 pub enum Arg {
-    ProcessorState,
+    ExecState,
+    ExecStateExtra,
     Tlb,
     IoMMUIdentifier,
     HaltReasonPtr,
@@ -121,6 +258,7 @@ impl Arg {
     pub fn args() -> impl ExactSizeIterator<Item = Self> + DoubleEndedIterator {
         macro_rules! make_arr {
             ($($name: ident),+ $(,)?) => {{
+                #[deny(unreachable_patterns)]
                 fn _assert_handles_all_cases(this: Arg) {
                     match this { $(Arg::$name => ()),+ }
                 }
@@ -129,7 +267,7 @@ impl Arg {
                     let mut expected = 0;
                     $(
                     assert!(Arg::$name as u32 == expected);
-                    expected += 1;
+                    expected = expected.strict_add(1);
                     )+
 
                     let _ = expected;
@@ -139,29 +277,58 @@ impl Arg {
             }};
         }
 
-        let this = make_arr![ProcessorState, Tlb, IoMMUIdentifier, HaltReasonPtr, IoMMU];
+        let this = make_arr![
+            ExecState,
+            ExecStateExtra,
+            Tlb,
+            IoMMUIdentifier,
+            HaltReasonPtr,
+            IoMMU
+        ];
 
         this.into_iter()
     }
 
     pub fn ty(self) -> Type {
         match self {
-            Arg::ProcessorState => Type::HostPtr,
-            Arg::Tlb => Type::HostPtr,
-            Arg::IoMMUIdentifier => Type::I64,
-            Arg::HaltReasonPtr => Type::HostPtr,
-            Arg::IoMMU => Type::HostPtr,
+            Arg::ExecState => Type::HostPtr(AliasRegion::ExecState),
+            Arg::ExecStateExtra => Type::HostPtr(AliasRegion::ExecStateExtra),
+            Arg::Tlb => Type::HostPtr(AliasRegion::Tlb),
+            // for the `IoMMUIdentifier`
+            // its not exactly true, since we do clone the identifier which bumps a refcount
+            // but it honestly doesn't really matter at all since the code generated never refcounts
+            // alias analysis doesn't care about this, it only cares about the guarantee:
+            // nothing dereferences it, and it doesn't alias anything else tracked by the analysis.
+            // from the IRs prespective, these are opaque
+            Arg::IoMMUIdentifier => Type::HostPtr(AliasRegion::ReadOnly),
+            Arg::HaltReasonPtr => Type::HostPtr(AliasRegion::HaltReason),
+            Arg::IoMMU => Type::HostPtr(AliasRegion::ReadOnly),
         }
     }
 
     pub fn as_ssa_value(self) -> SSAValue {
         match self {
-            Arg::ProcessorState => SSAValue::ARG_PROCESSOR_STATE,
+            Arg::ExecState => SSAValue::ARG_EXEC_STATE,
+            Arg::ExecStateExtra => SSAValue::ARG_EXEC_STATE_EXTRA,
             Arg::Tlb => SSAValue::ARG_TLB_PTR,
             Arg::IoMMUIdentifier => SSAValue::ARG_IO_MMU_IDENT,
             Arg::HaltReasonPtr => SSAValue::ARG_HALT_REASON_PTR,
             Arg::IoMMU => SSAValue::ARG_IO_MMU,
         }
+    }
+
+    pub fn from_ssa_value(value: SSAValue) -> Option<Self> {
+        // TODO add macro to make sure each Arg has an associated SSAValue
+        Some(match value {
+            SSAValue::ARG_EXEC_STATE => Arg::ExecState,
+            SSAValue::ARG_EXEC_STATE_EXTRA => Arg::ExecStateExtra,
+            SSAValue::ARG_TLB_PTR => Arg::Tlb,
+            SSAValue::ARG_IO_MMU_IDENT => Arg::IoMMUIdentifier,
+            SSAValue::ARG_HALT_REASON_PTR => Arg::HaltReasonPtr,
+            SSAValue::ARG_IO_MMU => Arg::IoMMU,
+
+            _ => return None,
+        })
     }
 }
 
@@ -293,9 +460,9 @@ enum BitwiseOp {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum ShiftOp {
-    // SignExtendShr,
+    SignExtendShr,
     ZeroExtendShr,
-    // Shl,
+    Shl,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -306,20 +473,20 @@ pub enum IntCmp {
     NotEqual,
     /// Signed `<`.
     SignedLessThan,
-    /// Signed `>=`.
-    SignedGreaterThanOrEqual,
-    /// Signed `>`.
-    SignedGreaterThan,
     /// Signed `<=`.
     SignedLessThanOrEqual,
+    /// Signed `>`.
+    SignedGreaterThan,
+    /// Signed `>=`.
+    SignedGreaterThanOrEqual,
     /// Unsigned `<`.
     UnsignedLessThan,
-    /// Unsigned `>=`.
-    UnsignedGreaterThanOrEqual,
-    /// Unsigned `>`.
-    UnsignedGreaterThan,
     /// Unsigned `<=`.
     UnsignedLessThanOrEqual,
+    /// Unsigned `>`.
+    UnsignedGreaterThan,
+    /// Unsigned `>=`.
+    UnsignedGreaterThanOrEqual,
 }
 
 type HostCallback = unsafe extern "C" fn(...);
@@ -333,8 +500,16 @@ struct CallbackSignatureData {
 macro_rules! make_store_signature {
     ($ty: ident) => {
         CallbackSignatureData {
-            // IoMMU, tlb, vaddr, out_param
-            args: Cow::Borrowed(&[Type::HostPtr, Type::HostPtr, Type::I64, Type::$ty]),
+            args: Cow::Borrowed(&[
+                // io_mmu
+                Type::HostPtr(AliasRegion::ReadOnly),
+                // tlb
+                Type::HostPtr(AliasRegion::Tlb),
+                // vaddr
+                Type::I64,
+                // stored_value
+                Type::$ty,
+            ]),
             // IoMmuStatus
             ret: Some(Type::I8),
         }
@@ -345,8 +520,16 @@ impl_storable! {
     CallbackSignatureData as impl CallbackSignature;
     init: {
         const LOAD_FALLBACK = CallbackSignatureData {
-            // IoMMU, tlb, vaddr, out_param
-            args: Cow::Borrowed(&[Type::HostPtr, Type::HostPtr, Type::I64, Type::HostPtr]),
+            args: Cow::Borrowed(&[
+                // io_mmu
+                Type::HostPtr(AliasRegion::ReadOnly),
+                // tlb
+                Type::HostPtr(AliasRegion::Tlb),
+                // vaddr
+                Type::I64,
+                // out_param
+                Type::HostPtr(AliasRegion::ScratchSpace)
+            ]),
             // IoMmuStatus
             ret: Some(Type::I8),
         };
@@ -431,6 +614,8 @@ enum StmtKind {
         imm64: u64,
     },
 
+    IntNeg(SSAValue),
+
     /// Produces:
     ///   0: arithmetic result
     ///   1: overflow flag
@@ -470,10 +655,20 @@ enum StmtKind {
         rhs: u64,
     },
 
+    BitNot(SSAValue),
+
+    /// computes unboudned shift
+    Shift {
+        op: ShiftOp,
+        value: SSAValue,
+        shift: SSAValue,
+    },
+
+    /// `shift` is always less than `(value.ty as Int).width`
     ShiftImm {
         op: ShiftOp,
         value: SSAValue,
-        shift_ammount: u8,
+        shift: u8,
     },
 
     /// Load from a host pointer plus a constant byte offset.
@@ -542,23 +737,26 @@ enum StmtKind {
         value: SSAValue,
     },
 
-    /// loads the halt reason found at Arg::HaltReasonPtr
+    /// loads the halt reason found at [`Arg::HaltReasonPtr`]
     /// implemntation:
     /// its a relaxed atomic 32 bit native entain load
     /// this is more like `HasPendingHaltReasonButReturnsBitsBecauseBrZNeedsAValue`
-    /// if it returns yes then, and only then do you syncronize, because this makes
+    /// if it returns yes then, and only then do you synchronize, because this makes
     /// the fast path (no halt) very fast
     LoadHaltReason,
 
-    /// takes the halt reason found at Arg::HaltReasonPtr
+    /// takes the halt reason found at [`Arg::HaltReasonPtr`]
     /// and replaces it with 0
-    /// implementation: AcqRel xchg \[HaltReasonPtr] 0
+    /// implementation: AcqRel xchg [`Arg::HaltReasonPtr`] 0
     TakeHaltReason,
 
-    /// **relaxed** atomic byte load
+    /// an atomic **SeqCst** fence followed by an atomic **SeqCst** `load`
+    /// of the [`Page::DIRTY_FLAG_IS_DIRTY`] bit
+    /// look at [`Page::set_dirty`] for further details
     GetInstructionDirtyFlag(SSAValue),
 
-    /// **release** atomic byte store to the value `1`
+    /// atomic **SeqCst** `fetch_or` of the [`Page::DIRTY_FLAG_IS_DIRTY`] bit
+    /// look at [`Page::set_dirty`] for further details
     SetInstructionDirtyFlag(SSAValue),
 
     Safepoint,
@@ -720,6 +918,9 @@ pub struct ExecIr {
     block_compile_order: Vec<Block>,
 }
 
+// TODO: figure out a way to add and embed alias information to
+//       the blocks arguments, and to the FFI's arguments
+#[derive(Debug)]
 pub struct ExecIrBuilder {
     ssa_values: Arena<SSAValueData>,
     blocks: Arena<BlockData>,
@@ -806,11 +1007,11 @@ impl ExecIrBuilder {
             TerminatorKind::Return => {}
 
             TerminatorKind::ReturnCode { halt_reason: int } => {
-                assert!(matches!(self.ssa_values[int].ty, Type::Int(_)))
+                std::assert_matches!(self.ssa_values[int].ty, Type::Int(_))
             }
 
             TerminatorKind::BrZ { cond: int } => {
-                assert!(matches!(self.ssa_values[int].ty, Type::Bool | Type::Int(_)));
+                std::assert_matches!(self.ssa_values[int].ty, Type::Bool | Type::Int(_));
                 let [zero, non_zero] = terminator.targets.as_array::<2>().unwrap();
                 if zero.target == non_zero.target && zero.parameters == non_zero.parameters {
                     terminator.targets.pop();
@@ -825,17 +1026,10 @@ impl ExecIrBuilder {
             assert_ne!(target, Block::ENTRYPOINT, "can't branch to entrypoint");
         }
 
-        let mark_cold = matches!(terminator.kind, TerminatorKind::ReturnCode { .. });
-
         let block_data = &mut self.blocks[block];
         assert!(!block_data.terminated);
         block_data.terminator = terminator;
         block_data.terminated = true;
-
-        if mark_cold && !block_data.is_cold {
-            // this makes sure we don't mark the entrypoint cold
-            self.mark_block_bold(block)
-        }
     }
 
     pub fn terminate(&mut self, terminator: Terminator) {
@@ -864,7 +1058,10 @@ impl ExecIrBuilder {
             | StmtKind::AddImm { value: lhs, .. }
             | StmtKind::Bitwise { lhs, .. }
             | StmtKind::BitwiseImm { lhs, .. }
+            | StmtKind::BitNot(lhs)
+            | StmtKind::IntNeg(lhs)
             | StmtKind::ShiftImm { value: lhs, .. }
+            | StmtKind::Shift { value: lhs, .. }
             | StmtKind::Select {
                 cond: _,
                 if_true: lhs,
@@ -879,18 +1076,29 @@ impl ExecIrBuilder {
 
             StmtKind::LoadHost { ty, .. } => match ty {
                 LoadType::Int(width) => iter_from_arr([Type::Int(width)]),
-                LoadType::HostPtr => iter_from_arr([Type::HostPtr]),
+                LoadType::HostPtr(alias) => iter_from_arr([Type::HostPtr(alias)]),
             },
 
             StmtKind::StoreHost { .. } => empty_iter(),
 
-            StmtKind::LoadStackPtr { .. } | StmtKind::PtrAdd { .. } => {
-                iter_from_arr([Type::HostPtr])
+            StmtKind::LoadStackPtr { .. } => {
+                iter_from_arr([Type::HostPtr(AliasRegion::ScratchSpace)])
+            }
+
+            StmtKind::PtrAdd { base_ptr, .. } => {
+                let ty = self.ssa_values[base_ptr].ty;
+                std::debug_assert_matches!(ty, Type::HostPtr(_));
+                iter_from_arr([ty])
             }
 
             StmtKind::PtrEq(..) => iter_from_arr([Type::Bool]),
             StmtKind::HasTag { .. } => iter_from_arr([Type::Bool]),
-            StmtKind::Untag { .. } => iter_from_arr([Type::HostPtr]),
+
+            StmtKind::Untag { ptr, .. } => {
+                let ty = self.ssa_values[ptr].ty;
+                std::debug_assert_matches!(ty, Type::HostPtr(_));
+                iter_from_arr([ty])
+            }
 
             StmtKind::HostCallback { signature, .. } => match self.signatures[signature].ret {
                 None => empty_iter(),
@@ -902,7 +1110,7 @@ impl ExecIrBuilder {
 
             StmtKind::LoadHaltReason | StmtKind::TakeHaltReason => iter_from_arr([Type::I32]),
 
-            StmtKind::GetInstructionDirtyFlag { .. } => iter_from_arr([Type::I8]),
+            StmtKind::GetInstructionDirtyFlag { .. } => iter_from_arr([Type::Bool]),
             StmtKind::SetInstructionDirtyFlag { .. } => empty_iter(),
 
             StmtKind::Safepoint => empty_iter(),
@@ -937,6 +1145,8 @@ impl ExecIrBuilder {
     /// # Safety
     ///
     /// the IR must not produce UB when run after compilation
+    ///
+    /// and the IR must have consistent expected types in and out
     unsafe fn emit_stmt_full<const N: usize>(&mut self, rvalue: StmtKind) -> [SSAValue; N] {
         let outputs = self
             .type_of(&rvalue)
@@ -989,7 +1199,7 @@ impl ExecIrBuilder {
         unsafe {
             self.emit_1ret_stmt(StmtKind::LoadHost {
                 ty: LoadType::Int(width),
-                base_ptr: SSAValue::ARG_PROCESSOR_STATE,
+                base_ptr: SSAValue::ARG_EXEC_STATE,
                 offset,
                 // it is always safe to access processor state
                 can_move: true,
@@ -1022,7 +1232,7 @@ impl ExecIrBuilder {
         unsafe {
             core::hint::assert_unchecked(x_reg < X_REGISTER_COUNT);
 
-            offset_of!(ProcessorState, x_registers)
+            offset_of!(ExecState, x_registers)
                 .unchecked_add((x_reg as usize).unchecked_mul(size_of::<u64>()))
         }
     }
@@ -1038,21 +1248,21 @@ impl ExecIrBuilder {
     }
 
     pub fn load_sp(&mut self) -> SSAValue {
-        unsafe { self.load_from_processor_state(offset_of!(ProcessorState, sp), IntWidth::W64) }
+        unsafe { self.load_from_processor_state(offset_of!(ExecState, sp), IntWidth::W64) }
     }
 
     pub fn load_pc(&mut self) -> SSAValue {
-        unsafe { self.load_from_processor_state(offset_of!(ProcessorState, pc), IntWidth::W64) }
+        unsafe { self.load_from_processor_state(offset_of!(ExecState, pc), IntWidth::W64) }
     }
 
     pub fn load_pstate(&mut self) -> SSAValue {
-        unsafe { self.load_from_processor_state(offset_of!(ProcessorState, pstate), IntWidth::W32) }
+        unsafe { self.load_from_processor_state(offset_of!(ExecState, pstate), IntWidth::W32) }
     }
 
     unsafe fn store_to_processor_state(&mut self, offset: usize, value: SSAValue) {
         unsafe {
             self.emit_void_stmt(StmtKind::StoreHost {
-                base_ptr: SSAValue::ARG_PROCESSOR_STATE,
+                base_ptr: SSAValue::ARG_EXEC_STATE,
                 offset,
                 value,
                 // it is always safe to access processor state
@@ -1080,11 +1290,11 @@ impl ExecIrBuilder {
     }
 
     pub fn store_sp(&mut self, value: SSAValue) {
-        unsafe { self.store_processor_register(offset_of!(ProcessorState, sp), value) }
+        unsafe { self.store_processor_register(offset_of!(ExecState, sp), value) }
     }
 
     pub fn store_pc(&mut self, value: SSAValue) {
-        unsafe { self.store_processor_register(offset_of!(ProcessorState, pc), value) }
+        unsafe { self.store_processor_register(offset_of!(ExecState, pc), value) }
     }
 
     pub fn store_pstate(&mut self, value: SSAValue) {
@@ -1092,7 +1302,7 @@ impl ExecIrBuilder {
             panic!("can only store 32 bit integers to pstate")
         };
 
-        unsafe { self.store_to_processor_state(offset_of!(ProcessorState, pstate), value) }
+        unsafe { self.store_to_processor_state(offset_of!(ExecState, pstate), value) }
     }
 
     pub fn select(&mut self, cond: SSAValue, if_true: SSAValue, if_false: SSAValue) -> SSAValue {
@@ -1193,6 +1403,7 @@ impl ExecIrBuilder {
         })
     }
 
+    #[inline(always)]
     fn bitwise_type_guard<T>(
         &mut self,
         lhs: Type,
@@ -1201,7 +1412,9 @@ impl ExecIrBuilder {
     ) -> T {
         match (lhs, rhs) {
             (Type::Bool, Type::Bool) => emit(self),
-            (Type::HostPtr, Type::HostPtr) => emit(self),
+            (Type::HostPtr(_), Type::HostPtr(_)) => {
+                panic!("bitwise operations on pointers are not allowed")
+            }
             (Type::Int(width1), Type::Int(width2)) => match width1 == width2 {
                 true => emit(self),
                 false => panic!("mismatched integer widths used for bitwise op"),
@@ -1254,24 +1467,72 @@ impl ExecIrBuilder {
         self.emit_bitwise_imm(BitwiseOp::Xor, lhs, rhs)
     }
 
-    fn emit_shift_op(&mut self, op: ShiftOp, value: SSAValue, bits: u8) -> SSAValue {
+    pub fn bitnot(&mut self, value: SSAValue) -> SSAValue {
+        let ty = self.ssa_values[value].ty;
+        self.bitwise_type_guard(ty, ty, |this| unsafe {
+            this.emit_1ret_stmt(StmtKind::BitNot(value))
+        })
+    }
+
+    fn emit_shift_op(&mut self, op: ShiftOp, value: SSAValue, shift: SSAValue) -> SSAValue {
+        let Type::Int(_) = self.ssa_values[value].ty else {
+            panic!("can only shift integers")
+        };
+
+        let Type::Int(_) = self.ssa_values[shift].ty else {
+            panic!("can only shift integers by integers")
+        };
+
+        unsafe { self.emit_1ret_stmt(StmtKind::Shift { op, value, shift }) }
+    }
+
+    fn emit_shift_imm_op(&mut self, op: ShiftOp, value: SSAValue, mut bits: u8) -> SSAValue {
         let Type::Int(width) = self.ssa_values[value].ty else {
             panic!("can only shift integers")
         };
 
-        assert!((bits as u32) < width.bits());
+        if (bits as u32) >= width.bits() {
+            match op {
+                ShiftOp::ZeroExtendShr | ShiftOp::Shl => {
+                    return self.iconst(IConst::zero(width));
+                }
+                ShiftOp::SignExtendShr => {
+                    bits = width.bits().strict_sub(1).try_into().unwrap();
+                }
+            }
+        }
 
         unsafe {
             self.emit_1ret_stmt(StmtKind::ShiftImm {
                 op,
                 value,
-                shift_ammount: bits,
+                shift: bits,
             })
         }
     }
 
     pub fn ushr_imm(&mut self, value: SSAValue, bits: u8) -> SSAValue {
-        self.emit_shift_op(ShiftOp::ZeroExtendShr, value, bits)
+        self.emit_shift_imm_op(ShiftOp::ZeroExtendShr, value, bits)
+    }
+
+    pub fn sshr_imm(&mut self, value: SSAValue, bits: u8) -> SSAValue {
+        self.emit_shift_imm_op(ShiftOp::SignExtendShr, value, bits)
+    }
+
+    pub fn shl_imm(&mut self, value: SSAValue, bits: u8) -> SSAValue {
+        self.emit_shift_imm_op(ShiftOp::Shl, value, bits)
+    }
+
+    pub fn ushr(&mut self, value: SSAValue, shift: SSAValue) -> SSAValue {
+        self.emit_shift_op(ShiftOp::ZeroExtendShr, value, shift)
+    }
+
+    pub fn sshr(&mut self, value: SSAValue, shift: SSAValue) -> SSAValue {
+        self.emit_shift_op(ShiftOp::SignExtendShr, value, shift)
+    }
+
+    pub fn shl(&mut self, value: SSAValue, shift: SSAValue) -> SSAValue {
+        self.emit_shift_op(ShiftOp::Shl, value, shift)
     }
 
     pub fn set_nzcv_flags(&mut self, n: SSAValue, z: SSAValue, c: SSAValue, v: SSAValue) {
@@ -1334,12 +1595,11 @@ impl ExecIrBuilder {
         value
     }
 
-    pub fn add(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
+    pub fn iadd(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
         self.emit_arith_binop(ArithBinOp::Add, lhs, rhs)
     }
 
-    pub fn add_imm(&mut self, value: SSAValue, amount: IConst) -> SSAValue {
-        // FIXME clean up code duplication
+    pub fn iadd_imm(&mut self, value: SSAValue, amount: IConst) -> SSAValue {
         self.emit_same_int_ty_imm("arithmetic", value, amount.width, move |this| unsafe {
             this.emit_1ret_stmt(StmtKind::AddImm {
                 value,
@@ -1348,11 +1608,11 @@ impl ExecIrBuilder {
         })
     }
 
-    pub fn sub(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
+    pub fn isub(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
         self.emit_arith_binop(ArithBinOp::Sub, lhs, rhs)
     }
 
-    pub fn mul(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
+    pub fn imul(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
         self.emit_arith_binop(ArithBinOp::Mul, lhs, rhs)
     }
 
@@ -1430,28 +1690,22 @@ impl ExecIrBuilder {
         })
     }
 
-    pub fn neg(&mut self, value: SSAValue) -> SSAValue {
-        let Type::Int(width) = self.ssa_values[value].ty else {
-            panic!("can only negate an integer")
-        };
-
-        let zero = self.iconst(IConst::zero(width));
-
-        // TODO add native support for a negate stmt
-        self.sub(zero, value)
+    pub fn ineg(&mut self, value: SSAValue) -> SSAValue {
+        std::assert_matches!(self.ssa_values[value].ty, Type::Int(_));
+        unsafe { self.emit_1ret_stmt(StmtKind::IntNeg(value)) }
     }
 
-    pub fn adds(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
+    pub fn iadds(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
         self.emit_flag_setting_binop(OverflowingBinOp::Add, lhs, rhs)
     }
 
-    pub fn subs(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
+    pub fn isubs(&mut self, lhs: SSAValue, rhs: SSAValue) -> SSAValue {
         self.emit_flag_setting_binop(OverflowingBinOp::Sub, lhs, rhs)
     }
 
     fn get_scratch_space_ptr(&mut self, width: IntWidth) -> SSAValue {
-        let _ = width;
         const { assert!(IntWidth::MAX.bytes() == IntWidth::W64.bytes()) }
+        let _ = width;
 
         if self.scratch_space.is_none() {
             self.scratch_space = Some(self.create_stack_slot(
@@ -1589,7 +1843,7 @@ impl ExecIrBuilder {
     /// Shorthand to both increment `pc` and insert a safepoint
     pub fn next_insn(&mut self) {
         let pc = self.load_pc();
-        let new_pc = self.add_imm(pc, IConst::u64(4));
+        let new_pc = self.iadd_imm(pc, IConst::u64(4));
         self.store_pc(new_pc);
         self.add_safepoint()
     }
@@ -1625,12 +1879,12 @@ struct FallbackAccess {
 
 impl ExecIrBuilder {
     fn has_tag(&mut self, ptr: SSAValue, tag_bits: u8) -> SSAValue {
-        assert_eq!(self.ssa_values[ptr].ty, Type::HostPtr);
+        std::assert_matches!(self.ssa_values[ptr].ty, Type::HostPtr(_));
         unsafe { self.emit_1ret_stmt(StmtKind::HasTag { ptr, tag_bits }) }
     }
 
     fn untag_ptr(&mut self, ptr: SSAValue, tag_bits: u8) -> SSAValue {
-        assert_eq!(self.ssa_values[ptr].ty, Type::HostPtr);
+        std::assert_matches!(self.ssa_values[ptr].ty, Type::HostPtr(_));
         unsafe { self.emit_1ret_stmt(StmtKind::Untag { ptr, tag_bits }) }
     }
 
@@ -1689,8 +1943,12 @@ impl ExecIrBuilder {
         })
     }
 
+    // TODO/FIXME: figure out if you can actually **resume** the block for real
+    //             and have a way to actually add a resume functionality
+    //             this can be delayed for a pretty long time, but this comment
+    //             should stay as long as we aren't sure this isn't possible
     fn vm_access(&mut self, vaddr: SSAValue, access: VmAccessKind) -> Option<SSAValue> {
-        assert!(matches!(self.ssa_values[vaddr].ty, Type::I64));
+        std::assert_matches!(self.ssa_values[vaddr].ty, Type::I64);
 
         let width = access.width(self);
 
@@ -1708,11 +1966,11 @@ impl ExecIrBuilder {
             })
         };
 
-        let tlb_identifier = unsafe {
+        let io_mmu_ident = unsafe {
             self.emit_1ret_stmt(StmtKind::LoadHost {
-                ty: LoadType::HostPtr,
+                ty: LoadType::HostPtr(AliasRegion::ReadOnly),
                 base_ptr: tlb_entry_ptr,
-                offset: offset_of!(TlbEntry, tlb_identifier),
+                offset: offset_of!(TlbEntry, io_mmu_ident),
                 // tlb access is always valid; since there are always TLB_SIZE
                 // entries
                 can_move: true,
@@ -1720,7 +1978,7 @@ impl ExecIrBuilder {
         };
 
         let io_mmu_matches = unsafe {
-            self.emit_1ret_stmt(StmtKind::PtrEq(tlb_identifier, SSAValue::ARG_IO_MMU_IDENT))
+            self.emit_1ret_stmt(StmtKind::PtrEq(io_mmu_ident, SSAValue::ARG_IO_MMU_IDENT))
         };
 
         self.assert_or_jmp_to(io_mmu_matches, true, fallback_access.block);
@@ -1742,7 +2000,7 @@ impl ExecIrBuilder {
 
         let tagged_page_ptr = unsafe {
             self.emit_1ret_stmt(StmtKind::LoadHost {
-                ty: LoadType::HostPtr,
+                ty: LoadType::HostPtr(AliasRegion::VirtualMemory),
                 base_ptr: tlb_entry_ptr,
                 offset: offset_of!(TlbEntry, tagged_page_ptr),
                 // tlb access is always valid; since there are always TLB_SIZE
@@ -1796,52 +2054,54 @@ impl ExecIrBuilder {
             }
         };
 
-        if let VmAccessKind::Store { .. } = access {
-            let executable = MemProt::EXECUTE.bits();
-            let page_is_executable = self.has_tag(tagged_page_ptr, executable);
-            let check_if_not_already_dirty = self.create_block();
-            let continuation =
-                self.assert_or_jmp_to(page_is_executable, false, check_if_not_already_dirty);
+        match access {
+            VmAccessKind::Store { .. } => {
+                assert!(ret_value.is_none());
+                assert!(fallback_access.value.is_none());
+                let page_is_executable = self.has_tag(tagged_page_ptr, MemFlags::MUST_DIRTY.bits());
+                let check_if_not_already_dirty = self.create_block();
+                let continuation =
+                    self.assert_or_jmp_to(page_is_executable, false, check_if_not_already_dirty);
 
-            self.block_scope(check_if_not_already_dirty, |this| {
-                let insn_dirty_ptr = unsafe {
-                    this.emit_1ret_stmt(StmtKind::LoadHost {
-                        ty: LoadType::HostPtr,
-                        base_ptr: tlb_entry_ptr,
-                        offset: offset_of!(TlbEntry, insn_dirty_ptr),
-                        // tlb access is always valid; since there are always TLB_SIZE
-                        // entries
-                        can_move: true,
+                self.block_scope(check_if_not_already_dirty, |this| {
+                    // marked cold by `assert_or_jmp_to`
+                    let insn_dirty_ptr = unsafe {
+                        this.emit_1ret_stmt(StmtKind::LoadHost {
+                            ty: LoadType::HostPtr(AliasRegion::PageFlags),
+                            base_ptr: tlb_entry_ptr,
+                            offset: offset_of!(TlbEntry, insn_dirty_ptr),
+                            // tlb access is always valid; since there are always TLB_SIZE
+                            // entries
+                            can_move: true,
+                        })
+                    };
+
+                    let is_dirty = unsafe {
+                        this.emit_1ret_stmt(StmtKind::GetInstructionDirtyFlag(insn_dirty_ptr))
+                    };
+
+                    let set_insn_dirty = this.create_block();
+                    // if !is_dirty; goto continue; else goto set_insn_dirty;
+                    this.terminate(Terminator::BrNZ(is_dirty, continuation, set_insn_dirty));
+
+                    this.block_scope(set_insn_dirty, |this| {
+                        this.mark_current_block_cold();
+                        unsafe {
+                            this.emit_void_stmt(StmtKind::SetInstructionDirtyFlag(insn_dirty_ptr))
+                        }
+
+                        this.terminate(Terminator::Br(continuation))
                     })
-                };
+                });
+                self.terminate_block(fallback_access.ok_block, Terminator::Br(continuation));
 
-                let is_dirty = unsafe {
-                    this.emit_1ret_stmt(StmtKind::GetInstructionDirtyFlag(insn_dirty_ptr))
-                };
+                None
+            }
 
-                let set_insn_dirty = this.create_block();
-                // if is_dirty != 0; goto continue; else goto set_insn_dirty;
-                this.terminate(Terminator::BrNZ(is_dirty, continuation, set_insn_dirty));
+            VmAccessKind::Load { .. } => {
+                let ret_normal = ret_value.unwrap();
+                let ret_fallback = fallback_access.value.unwrap();
 
-                this.block_scope(set_insn_dirty, |this| {
-                    this.mark_current_block_cold();
-                    unsafe {
-                        this.emit_void_stmt(StmtKind::SetInstructionDirtyFlag(insn_dirty_ptr))
-                    }
-
-                    this.terminate(Terminator::Br(continuation))
-                })
-            })
-        }
-
-        let returns = match (ret_value, fallback_access.value) {
-            (Some(ret_normal), Some(ret_fallback)) => Some((ret_normal, ret_fallback)),
-            (None, None) => None,
-            _ => unreachable!(),
-        };
-
-        match returns {
-            Some((ret_normal, ret_fallback)) => {
                 let normal_access_block = self.current_block();
                 let merge_block = self.create_block();
                 self.switch_to(merge_block);
@@ -1859,15 +2119,32 @@ impl ExecIrBuilder {
 
                 Some(param)
             }
-            None => {
-                let current_block = self.current_block();
-                self.terminate_block(fallback_access.ok_block, Terminator::Br(current_block));
-
-                None
-            }
         }
     }
 
+    /// Loads `width` bytes of guest memory at `vaddr`.
+    ///
+    /// # Replayability
+    ///
+    /// This operation may trap. On trap, the JIT exits with a memory fault
+    /// reporting `vaddr`; a dispatcher above the JIT decides whether to
+    /// resolve it (e.g. CoW break-and-retry) or deliver it to the guest. If
+    /// resolved, **the faulting instruction is recompiled and re-executed
+    /// from scratch starting at this access** — there is no resumption
+    /// mid-instruction.
+    ///
+    /// This means every `vm_load`/`vm_store` for a guest instruction must
+    /// happen before any guest-visible state derived from them is
+    /// committed (register writes, flag updates, PC advance). If a load or
+    /// store traps and is later replayed, the whole instruction reruns from
+    /// the top — so nothing guest-visible may have been written yet when
+    /// the trap fires. Pure recomputation (re-reading a register,
+    /// re-deriving an address) is always safe to repeat; only writes to
+    /// guest-visible state are not.
+    ///
+    /// `width` must match the access width implied by the guest instruction
+    /// being translated; it is not validated against `vaddr`'s alignment
+    /// beyond the IR's own alignment fast-path check.
     pub fn vm_load(&mut self, vaddr: SSAValue, width: IntWidth) -> SSAValue {
         match self.vm_access(vaddr, VmAccessKind::Load { width }) {
             Some(value) => value,
@@ -1875,6 +2152,16 @@ impl ExecIrBuilder {
         }
     }
 
+    /// Stores `value` to guest memory at `vaddr`.
+    ///
+    /// # Replayability
+    ///
+    /// Same contract as [`Self::vm_load`]: this operation may trap, and a
+    /// resolved trap means the instruction is recompiled and re-executed
+    /// from scratch, not resumed. All memory accesses for the instruction —
+    /// loads and stores alike — must happen before any guest-visible
+    /// register or flag commit, since a later trap would replay the whole
+    /// instruction including any commit that already ran.
     pub fn vm_store(&mut self, vaddr: SSAValue, value: SSAValue) {
         let out = self.vm_access(vaddr, VmAccessKind::Store { value });
         debug_assert!(out.is_none());
@@ -1929,6 +2216,7 @@ impl ExecIrBuilder {
     #[must_use]
     pub fn build(mut self) -> ExecIr {
         halt_check_pass::insert_halt_checks(&mut self);
+        optimization_pass::optimize(&mut self);
         let reverse_post_order = self.topo_sort();
         ExecIr {
             ssa_values: self.ssa_values,

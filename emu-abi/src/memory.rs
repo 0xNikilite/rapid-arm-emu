@@ -7,13 +7,13 @@ use std::num::NonZero;
 use std::ops::{BitAnd, BitOr};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[allow(
     clippy::cast_possible_truncation,
     reason = "shifts never overflow a u8"
 )]
-const fn compue_shift(power_of_2: u64) -> u8 {
+const fn compute_shift(power_of_2: u64) -> u8 {
     let power_of_2 = NonZero::new(power_of_2).unwrap();
     assert!(power_of_2.is_power_of_two());
     let bits = power_of_2.trailing_zeros();
@@ -29,11 +29,47 @@ const fn compute_mask(size: u64) -> u64 {
 pub const PAGE_SIZE_U64: u64 = 4096;
 pub const PAGE_SIZE: usize = u64_to_usize(PAGE_SIZE_U64).unwrap();
 
+#[repr(C, align(4096))]
+pub struct UninitPageMut([MaybeUninit<u8>; PAGE_SIZE]);
+
+impl UninitPageMut {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        const { Self([MaybeUninit::uninit(); PAGE_SIZE]) }
+    }
+
+    pub fn page_pointer_mut(&mut self) -> PagePointer {
+        unsafe { PagePointer::new(NonNull::new_unchecked(self.0.as_mut_ptr()).cast()) }
+    }
+
+    pub fn page_pointer_ref(&self) -> PagePointer {
+        unsafe { PagePointer::new(NonNull::new_unchecked(self.0.as_ptr().cast_mut()).cast()) }
+    }
+
+    /// # Safety
+    ///
+    /// must point to a live - non-dangling - page
+    pub unsafe fn from_ptr<'a>(ptr: PagePointer) -> &'a mut Self {
+        unsafe { ptr.as_non_null_ptr().cast::<Self>().as_mut() }
+    }
+}
+
+impl Default for UninitPageMut {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const _: () = {
+    assert!(align_of::<UninitPageMut>() == PAGE_SIZE && size_of::<UninitPageMut>() == PAGE_SIZE)
+};
+
 pub const CACHE_LINE_SIZE_U64: u64 = 64;
 pub const CACHE_LINE_SIZE: usize = u64_to_usize(CACHE_LINE_SIZE_U64).unwrap();
 
-pub const PAGE_SHIFT: u8 = compue_shift(PAGE_SIZE_U64);
-pub const CACHE_LINE_SHIFT: u8 = compue_shift(CACHE_LINE_SIZE_U64);
+pub const PAGE_SHIFT: u8 = compute_shift(PAGE_SIZE_U64);
+pub const CACHE_LINE_SHIFT: u8 = compute_shift(CACHE_LINE_SIZE_U64);
 
 pub const PAGE_OFFSET_MASK_U64: u64 = compute_mask(PAGE_SIZE_U64);
 pub const PAGE_OFFSET_MASK: usize = u64_to_usize(PAGE_OFFSET_MASK_U64).unwrap();
@@ -72,7 +108,7 @@ impl MemProt {
     }
 
     #[inline(always)]
-    pub const fn contains(self, other: MemProt) -> bool {
+    pub const fn contains_any(self, other: Self) -> bool {
         (self.0 & other.0) != 0
     }
 }
@@ -90,6 +126,81 @@ impl BitAnd for MemProt {
 
     fn bitand(self, rhs: Self) -> Self::Output {
         self.retain(rhs)
+    }
+}
+
+impl std::ops::Not for MemProt {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        Self((!self.bits()) & Self::ALL.bits())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct MemFlags(u8);
+
+impl MemFlags {
+    const fn new_flag(bit: u8) -> Self {
+        assert!(bit.count_ones() == 1);
+        assert!((bit & MemProt::ALL.0) == 0);
+        Self(bit)
+    }
+
+    #[inline(always)]
+    pub const fn from_prot(prot: MemProt) -> Self {
+        Self(prot.0)
+    }
+
+    pub const NONE: Self = Self(0);
+
+    pub const READ: Self = Self::from_prot(MemProt::READ);
+    pub const WRITE: Self = Self::from_prot(MemProt::WRITE);
+    pub const EXECUTE: Self = Self::from_prot(MemProt::EXECUTE);
+
+    pub const DMA_DEV: Self = Self::new_flag(0b001_000);
+    pub const COW: Self = Self::new_flag(0b010_000);
+
+    pub const MUST_DIRTY: Self = Self::EXECUTE.union(Self::DMA_DEV);
+
+    pub const ALL: Self = Self::from_prot(MemProt::ALL)
+        .union(Self::COW)
+        .union(Self::DMA_DEV);
+
+    #[inline(always)]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    #[inline(always)]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[inline(always)]
+    pub const fn retain(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    #[inline(always)]
+    pub const fn contains_any(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+impl From<MemProt> for MemFlags {
+    #[inline(always)]
+    fn from(value: MemProt) -> Self {
+        Self::from_prot(value)
+    }
+}
+
+impl<T: Into<MemFlags>> BitOr<T> for MemFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: T) -> Self::Output {
+        self.union(rhs.into())
     }
 }
 
@@ -111,6 +222,20 @@ unsafe impl Sync for HostPointer {}
 pub struct PagePointer(HostPointer);
 
 impl PagePointer {
+    /// # Note:
+    ///
+    /// you can never know if a page is truly `Self::DANGLING`
+    /// therefore you must ensure that if you have `Self::DANGLING`
+    /// you never access it in any way, and checking for it equalling dangling
+    /// may exclude real pages
+    pub const DANGLING: Self = {
+        // make sure you can always offset into any place inside the dangling page
+        assert!(PAGE_SIZE.checked_add(PAGE_SIZE).is_some());
+        Self(HostPointer(NonNull::without_provenance(
+            NonZero::new(PAGE_SIZE).unwrap(),
+        )))
+    };
+
     /// # Safety
     ///
     /// `page` must be aligned to PAGE_SIZE
@@ -118,12 +243,16 @@ impl PagePointer {
     /// this range must not "wrap around" the edge of the address space.
     pub unsafe fn new(page: NonNull<AtomicU8>) -> Self {
         unsafe { std::hint::assert_unchecked((page.addr().get() & PAGE_OFFSET_MASK) == 0) }
+        unsafe { std::hint::assert_unchecked(page.addr().get().is_multiple_of(PAGE_SIZE)) }
         Self(HostPointer(page))
     }
 
     #[inline(always)]
-    pub const fn as_non_null_ptr(self) -> NonNull<AtomicU8> {
-        self.0.0
+    pub fn as_non_null_ptr(self) -> NonNull<AtomicU8> {
+        let ptr = self.0.0;
+        unsafe { std::hint::assert_unchecked((ptr.addr().get() & PAGE_OFFSET_MASK) == 0) }
+        unsafe { std::hint::assert_unchecked(ptr.addr().get().is_multiple_of(PAGE_SIZE)) }
+        ptr
     }
 
     /// # Safety
@@ -132,15 +261,10 @@ impl PagePointer {
     /// `T` has a a layout of size `PAGE_SIZE` and align of `PAGE_SIZE`
     #[inline(always)]
     pub unsafe fn add_pages(self, count: usize) -> Self {
-        #[repr(C)]
-        struct PageMemLayout([AtomicU8; PAGE_SIZE]);
-
-        const _: () = assert!(size_of::<PageMemLayout>() == PAGE_SIZE);
-
         unsafe {
             Self::new(
                 self.as_non_null_ptr()
-                    .cast::<PageMemLayout>()
+                    .cast::<UninitPageMut>()
                     .add(count)
                     .cast::<AtomicU8>(),
             )
@@ -159,29 +283,61 @@ impl PagePointer {
 #[derive(Copy, Clone)]
 pub struct Page<'a> {
     pub ptr: TaggedPagePtr,
-    pub insn_dirty: &'a AtomicBool,
+    pub dirty_flags: &'a AtomicU8,
 }
 
 impl Page<'_> {
+    pub const DIRTY_FLAG_FLUSHING: u8 = 0b10;
+    pub const DIRTY_FLAG_IS_DIRTY: u8 = 0b01;
+
     #[inline(always)]
-    pub fn set_insn_dirty(&self) {
-        if self.ptr.prot().contains(MemProt::EXECUTE) {
+    pub fn set_dirty(&self) {
+        if self.ptr.flags().contains_any(MemFlags::MUST_DIRTY) {
             cold_path();
-            if !self.insn_dirty.load(Ordering::Relaxed) {
+
+            std::sync::atomic::fence(Ordering::SeqCst);
+
+            // knowing that `set_insn_dirty` always executes AFTER the pages have been modified,
+            // skipping the `fetch_or` when the dirty bit is already set is only safe `iff`
+            // OUR modifications to the page are guaranteed to be globally visible before some
+            // future flusher decides "nothing more to do" and clears the flag.
+            //
+            // that guarantee is a STORE-LOAD ordering: our store to the page must be ordered
+            // before our load of the flag, as observed by every other thread. Acquire/Release
+            // never provide that - they order StoreStore and LoadLoad/LoadStore,
+            // but a CPU is still free to have our page write sitting in its store buffer
+            // while our flag load is satisfied from cache. SeqCst is the only ordering
+            // that forbids this: every SeqCst operation is additionally placed on one
+            // single global total order, so our SeqCst load of the flag cannot be
+            // reordered ahead of our own prior SeqCst-adjacent store to the page from
+            // any other thread's point of view, closing exactly the reordering window
+            // that let a flusher race ahead, invalidate, and clean the flag while our
+            // write was still invisible.
+            //
+            // this is necessary as `fetch_or` on every write operation would be too
+            // expensive especially under contention, so we still skip it when we can —
+            // we're just no longer trying to get that skip for free with a cheaper
+            // ordering, since Acquire/Release was paying for a guarantee it never gave us.
+            // do pay close attention that this uses
+            // **`SeqCst`** specifically, not **`Acquire`** nor **`Relaxed`**, on this load.
+            //
+            // the `fetch_or` below does NOT need that same upgrade. its job is narrower:
+            // publish the new flag *value* to whoever reads it next, so that a future
+            // acquire/SeqCst read of `01`/`11` synchronizes-with this store and correctly
+            // sees our page write as happens-before. that publish is the textbook
+            // Release pattern, and `Release` is sufficient for it - by the time we reach
+            // this `fetch_or`, the StoreLoad hazard is already closed, because it only
+            // runs after the SeqCst load above has completed, and that load is what forced
+            // our page write to be globally visible. `B_A` is also already sequenced-before
+            // this `fetch_or` by plain program order. there is no second StoreLoad gap left
+            // for this operation to plug, so bumping it to `SeqCst` would only buy us a
+            // place in the global total order we don't need, at a cost we'd rather not pay.
+            if (self.dirty_flags.load(Ordering::SeqCst) & Self::DIRTY_FLAG_IS_DIRTY) == 0 {
                 cold_path();
-                self.insn_dirty.store(true, Ordering::Release)
+                self.dirty_flags
+                    .fetch_or(Self::DIRTY_FLAG_IS_DIRTY, Ordering::SeqCst);
             }
         }
-    }
-
-    #[inline(always)]
-    pub fn get_insn_dirty(&self) -> bool {
-        self.insn_dirty.load(Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    pub fn unset_insn_dirty(&self) {
-        self.insn_dirty.store(false, Ordering::Release)
     }
 }
 
@@ -268,7 +424,7 @@ impl IoMMUIdentifierRef<'_> {
 
 const _: () = {
     assert!(
-        (MemProt::ALL.bits() as u64 & !PAGE_OFFSET_MASK_U64) == 0,
+        (MemFlags::ALL.bits() as u64 & !PAGE_OFFSET_MASK_U64) == 0,
         "MemProt bits must fit in the low page-alignment bits"
     );
 };
@@ -325,6 +481,10 @@ impl PageNumber {
         self.0
     }
 
+    pub const fn vaddr_base(self) -> u64 {
+        self.0 << PAGE_SHIFT
+    }
+
     #[inline(always)]
     pub const fn inc(self) -> Option<Self> {
         const { assert!(Self::MAX.0 != u64::MAX) }
@@ -340,7 +500,7 @@ const _: () = assert!(PageNumber::MAX.inc().is_none());
 pub struct TaggedPagePtr(NonNull<AtomicU8>);
 
 impl TaggedPagePtr {
-    pub fn new(ptr: PagePointer, prot: MemProt) -> Self {
+    pub fn new(ptr: PagePointer, prot: MemFlags) -> Self {
         let prot: u8 = prot.bits();
         const { assert!((u8::MAX as usize) < PAGE_SIZE) }
         let ptr = ptr.as_non_null_ptr();
@@ -350,18 +510,18 @@ impl TaggedPagePtr {
 
     pub fn page_ptr(self) -> PagePointer {
         let ptr = self.0.map_addr(|addr| {
-            let mask = !usize::from(MemProt::ALL.bits());
+            let mask = !usize::from(MemFlags::ALL.bits());
             unsafe { NonZero::new_unchecked(addr.get() & mask) }
         });
 
         unsafe { PagePointer::new(ptr) }
     }
 
-    pub fn prot(self) -> MemProt {
-        let mask: u8 = MemProt::ALL.bits();
+    pub fn flags(self) -> MemFlags {
+        let mask: u8 = MemFlags::ALL.bits();
         let prot_usize = self.0.addr().get() & usize::from(mask);
         let prot_raw: u8 = unsafe { u8::try_from(prot_usize).unwrap_unchecked() };
-        MemProt(prot_raw)
+        MemFlags(prot_raw)
     }
 }
 
@@ -391,10 +551,10 @@ impl MaybeInvalidIdentifier {
 /// then `insn_dirty_ptr` must also be `Some`
 #[derive(Zeroable)]
 pub struct TlbEntry {
-    pub tlb_identifier: MaybeInvalidIdentifier,
+    pub io_mmu_ident: MaybeInvalidIdentifier,
     pub virtual_page_number: PageNumber,
     pub tagged_page_ptr: Option<TaggedPagePtr>,
-    pub insn_dirty_ptr: Option<NonNull<AtomicBool>>,
+    pub insn_dirty_ptr: Option<NonNull<AtomicU8>>,
 }
 
 impl TlbEntry {
@@ -405,7 +565,7 @@ impl TlbEntry {
         page: Page,
     ) {
         let Self {
-            tlb_identifier,
+            io_mmu_ident: tlb_identifier,
             virtual_page_number,
             tagged_page_ptr,
             insn_dirty_ptr,
@@ -413,7 +573,7 @@ impl TlbEntry {
 
         let tagged_ptr = page.ptr;
 
-        let new_insn_dirty_ptr = NonNull::<AtomicBool>::from_ref(page.insn_dirty);
+        let new_insn_dirty_ptr = NonNull::<AtomicU8>::from_ref(page.dirty_flags);
 
         if !std::ptr::addr_eq(tlb_identifier.as_ptr(), identifier.ptr().as_ptr()) {
             *tlb_identifier = MaybeInvalidIdentifier::new(identifier.clone_identifier());
@@ -473,7 +633,7 @@ impl Tlb {
     ) -> Option<Page<'a>> {
         let entry = self.entry(page_num);
 
-        if !std::ptr::addr_eq(entry.tlb_identifier.as_ptr(), ident.ptr().as_ptr())
+        if !std::ptr::addr_eq(entry.io_mmu_ident.as_ptr(), ident.ptr().as_ptr())
             || entry.virtual_page_number != page_num
         {
             cold_path();
@@ -485,7 +645,7 @@ impl Tlb {
         Some(unsafe {
             Page {
                 ptr: entry.tagged_page_ptr.unwrap_unchecked(),
-                insn_dirty: entry.insn_dirty_ptr.unwrap_unchecked().as_ref(),
+                dirty_flags: entry.insn_dirty_ptr.unwrap_unchecked().as_ref(),
             }
         })
     }

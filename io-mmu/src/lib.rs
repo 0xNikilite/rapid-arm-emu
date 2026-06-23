@@ -44,56 +44,31 @@
 //!    `store_byte/store16_le/store32_le/store64_le`.
 
 use crate::cpu_fabric::CpuFabric;
-use crate::page_table::PageTable;
+use crate::dma::DmaDevice;
+use crate::fault::{MemoryFault, ensure};
+use crate::icache::ICache;
+use crate::page_table::{MapRegion, MemMapFlags, PageTable};
 use emu_abi::abort::AbortGuard;
 use emu_abi::convert::u64_to_usize;
-use emu_abi::internal_traits::{AsFFI, CpuFabricPrivate, ICache};
 use emu_abi::memory::{
-    HostPointer, IoMMUIdentifier, IoMMUIdentifierRef, MemProt, PAGE_OFFSET_MASK_U64, PAGE_SHIFT,
+    IoMMUIdentifier, IoMMUIdentifierRef, MemFlags, MemProt, PAGE_OFFSET_MASK_U64, PAGE_SHIFT,
     PAGE_SIZE, PAGE_SIZE_U64, Page, PageNumber, PagePointer, Tlb,
 };
+use std::convert::Infallible;
 use std::hint::cold_path;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::num::NonZero;
 use std::process::abort;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
 pub mod cpu_fabric;
+pub mod dma;
+pub mod fault;
+pub mod icache;
 mod memops;
 mod page_table;
-
-/// Fault returned when a memory access is invalid.
-///
-/// This is returned when an access:
-/// - targets an unmapped page,
-/// - violates page permissions,
-/// - overflows the virtual address range,
-/// - fails an address-alignment check required by a specific operation,
-/// - crosses into an unmapped or insufficiently-permitted page,
-/// - or otherwise fails MMU validation.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("invalid memory access")]
-pub struct MemoryFault(());
-
-impl MemoryFault {
-    #[inline(always)]
-    #[cold]
-    pub const fn fault() -> Self {
-        cold_path();
-        Self(())
-    }
-}
-
-macro_rules! ensure {
-    ($($expr: expr),+ $(,)?) => {
-        if !($({ $expr })&&+) {
-            return Err(MemoryFault::fault())
-        }
-    };
-}
-
-pub(crate) use ensure;
 
 #[inline]
 fn div_rem_page_size(vaddr: u64) -> (PageNumber, usize) {
@@ -103,7 +78,7 @@ fn div_rem_page_size(vaddr: u64) -> (PageNumber, usize) {
 #[inline]
 fn div_page_size_checked(vaddr: u64) -> Result<PageNumber, MemoryFault> {
     let (page, offset) = div_rem_page_size(vaddr);
-    ensure!(offset == 0);
+    ensure!(vaddr: vaddr, offset == 0);
     Ok(page)
 }
 
@@ -114,14 +89,14 @@ pub(crate) struct PageTableAccess {
 }
 
 impl PageTableAccess {
-    fn get_pages(base: u64, size: u64) -> Result<Option<Self>, MemoryFault> {
-        let start_page = div_page_size_checked(base)?;
-        ensure!(size & PAGE_OFFSET_MASK_U64 == 0);
+    fn get_pages(base_vaddr: u64, size: u64) -> Result<Option<Self>, MemoryFault> {
+        let start_page = div_page_size_checked(base_vaddr)?;
+        ensure!(vaddr: base_vaddr, size & PAGE_OFFSET_MASK_U64 == 0);
         let page_count = size >> PAGE_SHIFT;
-        let (end_addr, overflow) = base.overflowing_add(size);
+        let (end_addr, overflow) = base_vaddr.overflowing_add(size);
         if overflow {
             const { assert!(PAGE_SIZE > 1) }
-            ensure!(end_addr == 0)
+            ensure!(vaddr: u64::MAX, end_addr == 0)
         }
 
         let Some(page_count) = NonZero::new(page_count) else {
@@ -179,7 +154,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         self.identifier.get_ref()
     }
 
-    fn change_token(&mut self) {
+    fn change_ident(&mut self) {
         self.identifier = IoMMUIdentifier::unique_token();
     }
 
@@ -187,23 +162,20 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         &self.fabric
     }
 
-    unsafe fn modify_table(
+    unsafe fn modify_table<E>(
         &mut self,
-        transform: impl FnOnce(&mut PageTable, &T) -> Result<bool, MemoryFault>,
-    ) -> Result<(), MemoryFault> {
+        transform: impl FnOnce(&mut PageTable, &CpuFabric<T>) -> Result<bool, E>,
+    ) -> Result<(), E> {
         struct ChangeIdentifier<'a, T: ?Sized + ICache>(&'a mut IoMMU<T>);
 
         impl<T: ?Sized + ICache> Drop for ChangeIdentifier<'_, T> {
             fn drop(&mut self) {
-                self.0.change_token()
+                self.0.change_ident()
             }
         }
 
         let identifier_change = ChangeIdentifier(self);
-        match transform(
-            &mut identifier_change.0.table,
-            identifier_change.0.fabric.icache(),
-        ) {
+        match transform(&mut identifier_change.0.table, &identifier_change.0.fabric) {
             Ok(true) => {
                 drop(identifier_change);
                 Ok(())
@@ -219,7 +191,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         }
     }
 
-    // TODO add the ability to map and unmap in a single operation
+    // TODO(low priority) add the ability to map and unmap in a single operation
     //      by simply using inclusive map ranges, OR by making you
     //      make size == page count directly
     unsafe fn map_region(
@@ -227,15 +199,15 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         base: u64,
         size: u64,
         mem_prot: MemProt,
-        base_ptr: Option<PagePointer>,
+        region: MapRegion,
     ) -> Result<(), MemoryFault> {
         let Some(access) = PageTableAccess::get_pages(base, size)? else {
             return Ok(());
         };
 
         unsafe {
-            self.modify_table(|pages, _icache| {
-                pages.map(access, mem_prot, base_ptr)?;
+            self.modify_table(|pages, icache| {
+                pages.map(icache, access, mem_prot, region)?;
                 let modified = true;
                 Ok(modified)
             })
@@ -260,33 +232,92 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     ///
     /// The caller must ensure that:
     /// - `ptr .. ptr + size` is valid for the lifetime of this MMU mapping,
-    /// - the pointed-to memory is initialized,
-    /// - the pointed-to memory is valid for both reads and writes at the host-memory
-    ///   level, regardless of the guest permissions applied by `protections`,
-    /// - the backing memory is not accessed directly while this mapping is alive,
-    ///   except by other MMUs that use the same `CpuFabric`
-    pub unsafe fn map_shared(
+    ///
+    /// - the pointed-to memory is initialized
+    ///
+    /// - the pointed-to memory is valid for both reads at the host-memory
+    ///   level, regardless of the guest permissions applied by `protections`
+    ///   and it also must have write permisions set if `readonly = false`
+    ///
+    /// - if `readonly = false` the backing memory is not accessed directly
+    ///   while this mapping is alive, except by other MMUs that use the same `CpuFabric`
+    ///   and if `readonly = true` then the memory pointed to by pointer must not be read
+    ///   while this mapping is alive
+    pub unsafe fn map_extern(
         &mut self,
         base: u64,
         size: u64,
         ptr: *mut u8,
+        readonly: bool,
+        shared: bool,
         protections: MemProt,
     ) -> Result<(), MemoryFault> {
         assert!(ptr.addr().is_multiple_of(PAGE_SIZE));
         assert!(!ptr.is_null());
 
-        unsafe {
-            self.map_region(
-                base,
-                size,
-                protections,
-                Some(PagePointer::new(NonNull::new_unchecked(ptr.cast()))),
-            )
-        }
+        let base_ptr = unsafe { PagePointer::new(NonNull::new_unchecked(ptr.cast())) };
+
+        let region = match (readonly, shared) {
+            (false, false) => MapRegion::Extern {
+                flags: MemMapFlags::Private,
+                base_ptr,
+            },
+            (true, false) => MapRegion::Extern {
+                flags: MemMapFlags::Cow,
+                base_ptr,
+            },
+            (false, true) => MapRegion::Extern {
+                flags: MemMapFlags::Shared,
+                base_ptr,
+            },
+            (true, true) => panic!("there is no such thing as shared readonly mappings"),
+        };
+
+        unsafe { self.map_region(base, size, protections, region) }
     }
 
-    pub fn map(&mut self, base: u64, size: u64, protections: MemProt) -> Result<(), MemoryFault> {
-        unsafe { self.map_region(base, size, protections, None) }
+    pub fn map(
+        &mut self,
+        base: u64,
+        size: u64,
+        lazy: bool,
+        shared: bool,
+        protections: MemProt,
+    ) -> Result<(), MemoryFault> {
+        let region = match (lazy, shared) {
+            (true | false, true) => MapRegion::Anon(MemMapFlags::Shared),
+            (false, false) => MapRegion::Anon(MemMapFlags::Private),
+            (true, false) => MapRegion::Anon(MemMapFlags::Cow),
+        };
+
+        unsafe { self.map_region(base, size, protections, region) }
+    }
+
+    pub fn map_device_dyn(
+        &mut self,
+        base: u64,
+        size: u64,
+        device: Arc<dyn DmaDevice>,
+        shared: bool,
+        protections: MemProt,
+    ) -> Result<(), MemoryFault> {
+        let region = MapRegion::Dma {
+            shared,
+            dev: device,
+        };
+
+        unsafe { self.map_region(base, size, protections, region) }
+    }
+
+    pub fn map_device(
+        &mut self,
+        base: u64,
+        size: u64,
+        device: impl DmaDevice,
+        shared: bool,
+        protections: MemProt,
+    ) -> Result<(), MemoryFault> {
+        self.map_device_dyn(base, size, Arc::new(device), shared, protections)
     }
 
     pub fn unmap(&mut self, start: u64, size: u64) -> Result<(), MemoryFault> {
@@ -295,15 +326,11 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         };
 
         unsafe {
-            self.modify_table(|table, icache| {
+            self.modify_table(|table, _fabric| {
                 let mut modified = false;
-                table.unmap(access, |page| {
-                    modified = true;
-                    if page.get_insn_dirty() {
-                        icache.invalidate(page.ptr.page_ptr());
-                        page.unset_insn_dirty();
-                    }
-                });
+
+                // no need to flush
+                table.unmap(access, |_| modified = true);
 
                 Ok(modified)
             })
@@ -332,6 +359,15 @@ impl<T: ?Sized + ICache> IoMMU<T> {
             })
         }
     }
+
+    pub fn fork(&mut self) -> Self {
+        self.change_ident();
+        Self {
+            table: self.table.fork(),
+            identifier: self.identifier.clone(),
+            fabric: self.fabric.clone(),
+        }
+    }
 }
 
 /// A cache layer that sits between the CPU and the page table, translating
@@ -340,8 +376,9 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 /// Implementors may satisfy lookups from a fast local structure (e.g. a TLB)
 /// or fall through to the page table on every call. Either way, the returned
 /// [`Page`] must be a valid view into the [`IoMMU`]'s backing memory for the
-/// requested page number — callers rely on this to uphold memory safety across
-/// the verify-then-access split in [`LookupCacheExt::access`].
+/// requested page number.
+// Note: callers rely on this to uphold memory safety across
+//       the verify-then-access split in [`LookupCacheExt::access`]
 ///
 /// # Safety
 ///
@@ -351,7 +388,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 /// a prior `Ok` is **undefined behaviour**: the cache's consistency guarantee
 /// is a precondition that callers are permitted to assume without checking.
 ///
-/// TODO seal trait
+// TODO seal trait
 pub unsafe trait LookupCache {
     /// Resolves `page` to a [`Page`] handle valid for the lifetime of `io_mmu`.
     ///
@@ -375,7 +412,7 @@ unsafe impl LookupCache for NoCache {
         io_mmu: &'a IoMMU<T>,
         page: PageNumber,
     ) -> Result<Page<'a>, MemoryFault> {
-        io_mmu.table.get_page(page)
+        io_mmu.table.get_page(page, &io_mmu.fabric)
     }
 }
 
@@ -388,15 +425,15 @@ unsafe impl LookupCache for Tlb {
     fn get_page<'a, T: ?Sized + ICache>(
         &mut self,
         io_mmu: &'a IoMMU<T>,
-        page: PageNumber,
+        page_num: PageNumber,
     ) -> Result<Page<'a>, MemoryFault> {
         let page = unsafe {
-            self.lookup(page, io_mmu.get_ident(), |page_num| {
-                io_mmu.table.get_page(page_num).ok()
+            self.lookup(page_num, io_mmu.get_ident(), |page_num| {
+                io_mmu.table.get_page(page_num, io_mmu.get_fabric()).ok()
             })
         };
 
-        page.ok_or_else(MemoryFault::fault)
+        page.ok_or_else(|| MemoryFault::general_protection(page_num.vaddr_base()))
     }
 }
 
@@ -447,7 +484,7 @@ pub(crate) trait LookupCacheExt: LookupCache {
         // entries rather than cold ones.
         for page_num in pages.iter().rev() {
             let page = self.get_page(io_mmu, page_num)?;
-            ensure!(verify(page_num, page))
+            ensure!(vaddr: page_num.vaddr_base(), verify(page_num, page))
         }
 
         // Forward walk gives the hardware prefetcher a predictable ascending
@@ -487,10 +524,14 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         len: usize,
         mem_ptr: *mut u8,
         required_prot: impl Into<Option<MemProt>> + Copy,
+        no_cow: bool,
         mut per_page_commit: impl FnMut(PageNumber, Page<'_>),
         mut step: impl FnMut(*const AtomicU8, *mut u8),
     ) -> Result<(), MemoryFault> {
-        let len = u64::try_from(len).map_err(|_| MemoryFault::fault())?;
+        let len = u64::try_from(len).map_err(|_| {
+            // len > u64::MAX
+            MemoryFault::general_protection(u64::MAX)
+        })?;
 
         let Some(len) = NonZero::new(len) else {
             return Ok(());
@@ -500,7 +541,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
 
         let (last_vaddr_maybe, overflowed) = vaddr.overflowing_add(len.get());
         if overflowed {
-            ensure!(last_vaddr_maybe == 0)
+            ensure!(vaddr: u64::MAX, last_vaddr_maybe == 0)
         }
 
         let last_addr_inclusive = last_vaddr_maybe.wrapping_sub(1);
@@ -523,9 +564,15 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         cache.access(
             self,
             access,
-            move |_, page| match required_prot.into() {
-                Some(required) => page.ptr.prot().contains(required),
-                None => true,
+            move |_, page| {
+                if no_cow && page.ptr.flags().contains_any(MemFlags::COW) {
+                    return false;
+                }
+
+                match required_prot.into() {
+                    Some(required) => page.ptr.flags().contains_any(required.into()),
+                    None => true,
+                }
             },
             |page_num, page| unsafe {
                 // use select unpredictable, as all loads and stores
@@ -582,6 +629,8 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         // so that mem isn't reborrowed
         let len = mem.len();
         let ptr = mem.as_mut_ptr().cast::<u8>();
+        // you can always read from a cow page
+        let no_cow = false;
         unsafe {
             self.mem_access(
                 cache,
@@ -589,6 +638,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 len,
                 ptr,
                 required_prot,
+                no_cow,
                 |_, _| {},
                 |vm_ptr, mem_ptr| {
                     let byte = memops::load_byte(vm_ptr);
@@ -603,10 +653,10 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     /// Loads a byte slice from virtual memory into `mem`.
     ///
     /// The load may span multiple pages. Every covered page must be mapped and have
-    /// read permission.
+    /// `READ` permission.
     ///
     /// Concurrent stores are allowed. The returned bytes may reflect a mixture of
-    /// values from racing stores, and this only guarentees single-copy atomicity
+    /// values from racing stores, and this only guarantees single-copy atomicity
     /// at the byte level
     ///
     /// On success, returns `mem` as an initialized `&mut [u8]`.
@@ -627,12 +677,12 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     /// The load may span multiple pages. Every covered page must be mapped.
     ///
     /// Concurrent stores are allowed. The returned bytes may reflect a mixture of
-    /// values from racing stores, and this only guarentees single-copy atomicity
+    /// values from racing stores, and this only guarantees single-copy atomicity
     /// at the byte level
     ///
     /// On success, returns `mem` as an initialized `&mut [u8]`.
     ///
-    /// Returns [`MemoryFault`] if the range is unmapped, or if address arithmetic overflows.
+    /// Returns [`MemoryFault`] if the range is unmapped or if address arithmetic overflows.
     pub fn load_into_uninit_force<'a>(
         &self,
         cache: impl LookupCache,
@@ -694,6 +744,8 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         mem: &[u8],
         required_prot: impl Into<Option<MemProt>> + Copy,
     ) -> Result<(), MemoryFault> {
+        // you can't store to a cow page that can lead to big bad UB
+        let no_cow = true;
         unsafe {
             self.mem_access(
                 cache,
@@ -701,7 +753,8 @@ impl<T: ?Sized + ICache> IoMMU<T> {
                 mem.len(),
                 mem.as_ptr().cast_mut(),
                 required_prot,
-                |_page_num, page| page.set_insn_dirty(),
+                no_cow,
+                |_page_num, page| page.set_dirty(),
                 |vm_ptr, mem_ptr| {
                     let byte = std::ptr::read(mem_ptr);
                     memops::store_byte(vm_ptr, byte)
@@ -713,13 +766,12 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     /// Stores a byte slice into virtual memory.
     ///
     /// The store may span multiple pages. Every covered page must be mapped and have
-    /// write permission.
+    /// `WRITE` permission.
     ///
     /// Concurrent loads and stores are allowed. Other threads may observe the write
-    /// as a sequence of byte or scalar operations according to the atomicity
-    /// guarantees of the underlying target operations.
+    /// as a sequence of byte operations
     ///
-    /// Returns [`MemoryFault`] if the range is unmapped, unwritable, or if address
+    /// Returns [`MemoryFault`] if the range is unmapped or if address
     /// arithmetic overflows.
     #[inline(always)]
     pub fn store(
@@ -738,8 +790,10 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     /// Concurrent loads and stores are allowed. Other threads may observe the write
     /// as a sequence of byte operations
     ///
-    /// Returns [`MemoryFault`] if the range is unmapped, or if address
+    /// Returns [`MemoryFault`] if the range is unmapped or if address
     /// arithmetic overflows.
+    ///
+    /// Note: writes will still fail if you try to write into a `COW` page
     #[inline(always)]
     pub fn store_force(
         &self,
@@ -764,7 +818,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
             assert!(PAGE_SIZE.is_multiple_of(ACCESS_SIZE as usize));
         }
 
-        ensure!(vaddr.is_multiple_of(ACCESS_SIZE as u64));
+        ensure!(vaddr: vaddr, vaddr.is_multiple_of(ACCESS_SIZE as u64));
 
         let (_page_num, offset, page) = cache.lookup_addr(self, vaddr)?;
         unsafe {
@@ -828,7 +882,7 @@ impl<T: ?Sized + ICache> IoMMU<T> {
     #[inline(always)]
     pub fn load_byte(&self, cache: impl LookupCache, vaddr: u64) -> Result<u8, MemoryFault> {
         let (page, offset) = self.single_page_access(cache, vaddr)?;
-        ensure!(page.ptr.prot().contains(MemProt::READ));
+        ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::READ));
         let byte = unsafe { memops::load_byte(page.ptr.page_ptr().byte_add(offset).as_ptr()) };
         Ok(byte)
     }
@@ -841,9 +895,9 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         value: u8,
     ) -> Result<(), MemoryFault> {
         let (page, offset) = self.single_page_access(cache, vaddr)?;
-        ensure!(page.ptr.prot().contains(MemProt::WRITE));
+        ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::WRITE));
         unsafe { memops::store_byte(page.ptr.page_ptr().byte_add(offset).as_ptr(), value) }
-        page.set_insn_dirty();
+        page.set_dirty();
         Ok(())
     }
 }
@@ -883,7 +937,9 @@ impl<T: ?Sized + ICache> IoMMU<T> {
             .checked_sub(bytes_left_in_base_page)
             .and_then(NonZero::new)
             .map(|overflow_amount| {
-                let second_page_num = base_page_num.inc().ok_or_else(MemoryFault::fault)?;
+                let second_page_num = base_page_num
+                    .inc()
+                    .ok_or_else(|| MemoryFault::general_protection(u64::MAX))?;
 
                 let page = cache.get_page(self, second_page_num)?;
 
@@ -941,7 +997,7 @@ macro_rules! emit_multi_word_load_store {
                     //
                     // which satisfies the safety requirement of `Page::load$bits`.
                     None => unsafe {
-                        ensure!(access.base_page.ptr.prot().contains(MemProt::READ));
+                        ensure!(vaddr: vaddr, access.base_page.ptr.flags().contains_any(MemFlags::READ));
                         let ptr = access.base_page.ptr.page_ptr().byte_add(access.base_page_offset);
                         memops::$load_name(ptr.as_ptr())
                     },
@@ -963,13 +1019,25 @@ macro_rules! emit_multi_word_load_store {
                         // Then we shift/or the two words to reconstruct the requested
                         // little-endian value.
 
+                        let lo_page_tagged_ptr = access.base_page.ptr;
+                        let hi_page_tagged_ptr = second_page.page.ptr;
+
                         ensure!(
-                            second_page.page.ptr.prot().contains(MemProt::READ),
-                            access.base_page.ptr.prot().contains(MemProt::READ),
+                            vaddr: vaddr,
+                            lo_page_tagged_ptr.flags().contains_any(MemFlags::READ)
                         );
 
-                        let hi_page_ptr = second_page.page.ptr.page_ptr();
-                        let lo_page_ptr = access.base_page.ptr.page_ptr();
+                        ensure!(
+                            vaddr: {
+                                vaddr
+                                    .checked_next_multiple_of(PAGE_SIZE_U64)
+                                    .unwrap_unchecked()
+                            },
+                            hi_page_tagged_ptr.flags().contains_any(MemFlags::READ)
+                        );
+
+                        let hi_page_ptr = hi_page_tagged_ptr.page_ptr();
+                        let lo_page_ptr = lo_page_tagged_ptr.page_ptr();
 
 
                         // SAFETY:
@@ -1028,8 +1096,7 @@ macro_rules! emit_multi_word_load_store {
                         // integer width.
                         let bit_offset = u32::try_from(
                             second_page.overflow_amount.get().unchecked_mul(8)
-                        )
-                        .unwrap_unchecked();
+                        ).unwrap_unchecked();
 
                         // SAFETY:
                         // Since `bit_offset < $bits`, this subtraction cannot underflow.
@@ -1087,13 +1154,15 @@ macro_rules! emit_multi_word_load_store {
                     // which satisfies the safety requirement of `Page::store$bits`.
                     None => unsafe {
                         let page = access.base_page;
-                        ensure!(page.ptr.prot().contains(MemProt::WRITE));
+                        ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::WRITE));
                         let ptr = page.ptr.page_ptr().byte_add(access.base_page_offset);
                         memops::$store_name(ptr.as_ptr(), value);
-                        page.set_insn_dirty();
+                        page.set_dirty();
                     },
 
                     Some(second_page) => unsafe {
+                        cold_path();
+
                         // Note: we can't load 2 words and combine them like the load case
                         //       since that would alter/mess with the atomicity of the bytes
                         //       next to the value
@@ -1102,17 +1171,25 @@ macro_rules! emit_multi_word_load_store {
                         let hi_page = second_page.page;
                         let lo_page = access.base_page;
 
+                        ensure!(
+                            vaddr: vaddr,
+                            lo_page.ptr.flags().contains_any(MemFlags::WRITE),
+                        );
 
                         ensure!(
-                            hi_page.ptr.prot().contains(MemProt::WRITE),
-                            lo_page.ptr.prot().contains(MemProt::WRITE),
+                            vaddr: {
+                                vaddr
+                                    .checked_next_multiple_of(PAGE_SIZE_U64)
+                                    .unwrap_unchecked()
+                            },
+                            hi_page.ptr.flags().contains_any(MemFlags::WRITE),
                         );
+
 
                         let hi_page_ptr = hi_page.ptr.page_ptr().as_non_null_ptr();
                         let lo_page_ptr = lo_page.ptr.page_ptr().as_non_null_ptr();
 
-                        let overflow = usize::from(second_page.overflow_amount.get());
-
+                        let overflow = second_page.overflow_amount.get();
 
                         let mut active_ptr = hi_page_ptr.byte_add(overflow).as_ptr();
                         let mut i = bytes.len();
@@ -1138,8 +1215,8 @@ macro_rules! emit_multi_word_load_store {
                             active_ptr = active_ptr.sub(1)
                         }
 
-                        lo_page.set_insn_dirty();
-                        hi_page.set_insn_dirty();
+                        lo_page.set_dirty();
+                        hi_page.set_dirty();
                     }
                 }
 
@@ -1174,13 +1251,13 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         mut cache: impl LookupCache,
         vaddr: u64,
     ) -> Result<(PagePointer, u32), MemoryFault> {
-        ensure!(vaddr.is_multiple_of(AARCH64_WORD_ALIGN as u64));
+        ensure!(vaddr: vaddr, vaddr.is_multiple_of(AARCH64_WORD_ALIGN as u64));
 
         // note since vaddr is aligned there is no need to check overflow or alignment;
         // for more on why this is always true look at `single_page_aligned_access`
         let (_page_number, offset, page) = cache.lookup_addr(self, vaddr)?;
 
-        ensure!(page.ptr.prot().contains(MemProt::EXECUTE));
+        ensure!(vaddr: vaddr, page.ptr.flags().contains_any(MemFlags::EXECUTE));
         unsafe {
             let page_ptr = page.ptr.page_ptr();
             let word_ptr = page_ptr.byte_add(offset);
@@ -1193,26 +1270,51 @@ impl<T: ?Sized + ICache> IoMMU<T> {
         self.fetch_aarch64_full(cache, vaddr).map(|(_, word)| word)
     }
 
-    pub fn flush_dirty_pages(&self) {
+    // TODO mark slow
+    pub fn flush_async(&self) {
         for (_page_num, page) in self.table.pages() {
-            if page.get_insn_dirty() {
-                self.fabric.icache().invalidate(page.ptr.page_ptr());
-                page.unset_insn_dirty();
-            }
+            page.flush_async(self.get_fabric());
         }
+    }
+
+    pub fn flush(&self) -> anyhow::Result<()> {
+        // TODO better api or at least just keep reusing ONE channel
+        let pending_jobs = self
+            .table
+            .pages()
+            .flat_map(|(_page_num, page)| page.bad_api_flush(self.get_fabric()))
+            .collect::<Vec<_>>();
+
+        // there is a collect and try for each deliberately
+        pending_jobs.into_iter().try_for_each(|pending_job| {
+            pending_job
+                .recv()
+                .unwrap_or_else(|_| anyhow::bail!("dma flusher thread exited"))
+        })
+    }
+
+    // TODO mark slow
+    pub fn copy_all_cow_pages(&mut self) {
+        let Ok(()) = unsafe {
+            self.modify_table(|table, _| {
+                let mut modified = false;
+                table.pages_mut().for_each(|(_, page)| {
+                    modified |= page.un_cow();
+                });
+
+                Ok::<bool, Infallible>(modified)
+            })
+        };
     }
 }
 
-impl<T: Sized + ICache> AsFFI for IoMMU<T> {
-    type Interface<'a>
-        = (IoMMUIdentifierRef<'a>, ManuallyDrop<IoMMU<dyn ICache + 'a>>)
-    where
-        T: 'a;
-
-    fn as_ffi<'a>(&'a self) -> Self::Interface<'a>
-    where
-        Self: 'a,
-    {
+impl<T: ?Sized + ICache> IoMMU<T> {
+    /// # Safety
+    ///
+    /// `ManuallyDrop<IoMMU<dyn ICache>>` must only be used whilsy self is alive
+    pub unsafe fn as_ffi<'a>(
+        &'a self,
+    ) -> (IoMMUIdentifierRef<'a>, ManuallyDrop<IoMMU<dyn ICache>>) {
         let ident_ref = self.get_ident();
         let guard = AbortGuard(());
         let identifier = unsafe { ident_ref.copy_identifier() };
@@ -1227,25 +1329,5 @@ impl<T: Sized + ICache> AsFFI for IoMMU<T> {
 
         guard.disarm();
         (ident_ref, new)
-    }
-}
-
-impl<'a> AsFFI for IoMMU<dyn ICache + 'a> {
-    type Interface<'b>
-        = (IoMMUIdentifierRef<'b>, ManuallyDrop<IoMMU<dyn ICache + 'b>>)
-    where
-        Self: 'b;
-
-    fn as_ffi<'b>(&'b self) -> Self::Interface<'b>
-    where
-        Self: 'b,
-    {
-        let ident_ref = self.get_ident();
-        let guard = AbortGuard(());
-        let this: IoMMU<dyn ICache + 'a> = unsafe { std::ptr::read(self) };
-        let new: IoMMU<dyn ICache + 'b> = this;
-        let borrowed = ManuallyDrop::new(new);
-        guard.disarm();
-        (ident_ref, borrowed)
     }
 }

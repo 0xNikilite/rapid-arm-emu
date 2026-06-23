@@ -1,16 +1,4 @@
-use crate::memory::PagePointer;
 use std::mem::MaybeUninit;
-
-/// This allows exposing things only inbetween the internal crates
-pub trait AsFFI {
-    type Interface<'a>
-    where
-        Self: 'a;
-
-    fn as_ffi<'a>(&'a self) -> Self::Interface<'a>
-    where
-        Self: 'a;
-}
 
 /// # Safety
 ///
@@ -27,12 +15,8 @@ pub unsafe trait InitInPlace: Sized {
     fn init(this: &mut MaybeUninit<Self>) -> &mut Self;
 }
 
-pub trait ICache {
-    fn invalidate(&self, page: PagePointer);
-}
-
-pub trait CpuFabricPrivate {
-    type ICache: ?Sized + ICache;
-
-    fn icache(&self) -> &Self::ICache;
+unsafe impl<T: Default> InitInPlace for T {
+    fn init(this: &mut MaybeUninit<Self>) -> &mut Self {
+        this.write(T::default())
+    }
 }

@@ -1,22 +1,8 @@
-//! CPU fabric state shared by emulated CPU contexts.
-//!
-//! The `cpu_fabric` module owns state that is conceptually shared between CPUs, cores.
-//! Today, that shared state is the exclusive monitor which is used to model
-//! load-exclusive/store-exclusive style atomic sequences.
-//!
-//! In the future, `CpuFabric` may grow to include other CPU-adjacent shared
-//! resources, such as interrupt routing, cache-coherency metadata, shared
-//! timing state, or other cross-core coordination structures. For now, it is a
-//! small wrapper around the exclusive monitor so cloned CPU contexts can observe
-//! and invalidate the same reservation state.
-
-use crate::HostPointer;
 use crossbeam_utils::CachePadded;
-use emu_abi::internal_traits::{CpuFabricPrivate, ICache, InitInPlace};
-use emu_abi::memory::{CACHE_LINE_SHIFT, CACHE_LINE_SIZE};
+use emu_abi::internal_traits::InitInPlace;
+use emu_abi::memory::{CACHE_LINE_SHIFT, CACHE_LINE_SIZE, HostPointer};
 use parking_lot::Mutex;
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::sync::Arc;
+use std::mem::MaybeUninit;
 
 const BUCKET_COUNT: u16 = 257;
 
@@ -182,125 +168,13 @@ impl ExclusiveMonitor {
     }
 }
 
-// dirty page manager
-struct CpuFabricInner<T: ?Sized + ICache> {
-    monitor: ExclusiveMonitor,
-    instruction_cache: T,
-}
-
-#[repr(transparent)]
-pub struct CpuFabric<T: ?Sized + ICache>(Arc<CpuFabricInner<T>>);
-
-impl<T: Sized + ICache> CpuFabric<T> {
-    pub(crate) fn into_dyn<'a>(self) -> CpuFabric<dyn ICache + 'a>
-    where
-        T: 'a,
-    {
-        CpuFabric(self.0)
-    }
-}
-
-impl<T: ?Sized + ICache> Clone for CpuFabric<T> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<T: ICache + InitInPlace> Default for CpuFabric<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: ICache> CpuFabric<T> {
-    pub fn new() -> Self
-    where
-        T: InitInPlace,
-    {
-        macro_rules! impl_init_in_place {
-            (@{ folded } $($field: ident: $ty: ty),*) => {{
-                fn _assert_all_fields_mentioned_and_unique<T: ICache>(inner: &CpuFabricInner<T>) {
-                    let CpuFabricInner { $($field),* } = inner;
-                    $(let _: &$ty = $field;)*
-                }
-
-                struct InitGuard<'a, T>(&'a mut ManuallyDrop<T>);
-
-                impl<T> Drop for InitGuard<'_, T> {
-                    fn drop(&mut self) {
-                        unsafe { ManuallyDrop::<T>::drop(self.0) }
-                    }
-                }
-
-                let mut arc: Arc<MaybeUninit<CpuFabricInner<T>>> = Arc::new_uninit();
-                let init_mut: &mut MaybeUninit<CpuFabricInner<T>> = Arc::get_mut(&mut arc).unwrap();
-
-                let init_ptr: *mut CpuFabricInner<T> = init_mut.as_mut_ptr();
-
-                $(let $field: InitGuard<$ty> = {
-                    let ptr: *mut $ty = unsafe { &raw mut ((*init_ptr).$field) };
-                    let maybe_uninit_ref: &mut MaybeUninit<$ty> = unsafe {
-                        ptr.cast::<MaybeUninit<$ty>>().as_mut_unchecked()
-                    };
-                    let init_ref: &mut $ty = <$ty as InitInPlace>::init(maybe_uninit_ref);
-                    let manualy_drop: &mut ManuallyDrop<$ty> = unsafe {
-                        &mut *(init_ref as *mut $ty as *mut ManuallyDrop<$ty>)
-                    };
-
-                    InitGuard(manualy_drop)
-                };)*
-
-                $(std::mem::forget($field);)*
-
-                unsafe { arc.assume_init() }
-            }};
-            () => { impl_init_in_place!(@{ folded }) };
-            ($($field: ident : $ty: ty),+ $(,)?) => {
-                impl_init_in_place!(@{ folded } $($field: $ty),*)
-            }
-        }
-
-        let inner = impl_init_in_place! {
-            monitor: ExclusiveMonitor,
-            instruction_cache: T,
-        };
-
-        CpuFabric(inner)
-    }
-}
-
-impl<T: ICache> PartialEq for CpuFabric<T> {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl<T: ICache> Eq for CpuFabric<T> {}
-
-const _: () = {
-    fn _assert_cpu_fabric_send_sync<T: ICache + Send + Sync>() {
-        const fn is_sync<T: Sync>() {}
-        const fn is_send<T: Send>() {}
-
-        is_send::<CpuFabric<T>>();
-        is_sync::<CpuFabric<T>>();
-    }
-};
-
-impl<T: ?Sized + ICache> CpuFabricPrivate for CpuFabric<T> {
-    type ICache = T;
-
-    fn icache(&self) -> &Self::ICache {
-        &self.0.instruction_cache
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZero;
     use std::ptr::NonNull;
 
+    use crate::cpu_fabric::exclusive_monitor::ExclusiveMonitorLoad;
     use loom::sync::{Arc, Condvar, Mutex};
 
     struct BarrierState {

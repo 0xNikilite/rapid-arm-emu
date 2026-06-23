@@ -1,12 +1,12 @@
 use crate::helper::{call_compiled, compile, run_success, u64_const};
-use emu_abi::processor_state::ProcessorState;
+use emu_abi::exec_state::ExecState;
 use exec_ir::{Block, ExecIrBuilder, IntWidth};
 
 mod helper;
 
 #[test]
 fn empty_ir_returns_success_and_preserves_basic_state() {
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.sp = 0x1111;
     state.pc = 0x2222;
     state.x_registers[0] = 0x3333;
@@ -28,17 +28,17 @@ fn compiled_block_can_be_called_more_than_once() {
 
     let x0 = builder.load_x_reg::<0>(IntWidth::W64);
     let one = u64_const(&mut builder, 1);
-    let incremented = builder.add(x0, one);
+    let incremented = builder.iadd(x0, one);
     builder.store_x_reg::<0>(incremented);
 
     let compiled = compile(builder);
 
-    let mut first = ProcessorState::initial();
+    let mut first = ExecState::initial();
     first.x_registers[0] = 10;
     assert_eq!(call_compiled(&compiled, &mut first), 0);
     assert_eq!(first.x_registers[0], 11);
 
-    let mut second = ProcessorState::initial();
+    let mut second = ExecState::initial();
     second.x_registers[0] = u64::MAX;
     assert_eq!(call_compiled(&compiled, &mut second), 0);
     assert_eq!(second.x_registers[0], 0);

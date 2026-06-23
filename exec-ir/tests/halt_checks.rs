@@ -1,6 +1,6 @@
 use crate::helper::{call_compiled, compile, empty_io_mmu, run_full, run_success, store_x_const};
+use emu_abi::exec_state::ExecState;
 use emu_abi::halt_reason::HaltReason;
-use emu_abi::processor_state::ProcessorState;
 use exec_ir::{ExecIrBuilder, IConst, IntWidth, IrBuilderConfig, Terminator};
 use std::num::NonZero;
 
@@ -14,7 +14,7 @@ fn instruction_done_increments_pc_by_four_each_time() {
     builder.next_insn();
     builder.next_insn();
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.pc = 0x1000;
 
     run_success(builder, &mut state);
@@ -33,7 +33,7 @@ fn explicit_halt_check_every_instruction_still_retires_all_instructions() {
     builder.next_insn();
     builder.next_insn();
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.pc = 0x40;
 
     run_success(builder, &mut state);
@@ -55,7 +55,7 @@ fn automatic_halt_check_split_at_default_interval_preserves_pc_progress() {
 
     let compiled = compile(builder);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     for inital_pc in [0x1000, 0x1100, 0x8080] {
         state.pc = inital_pc;
         call_compiled(&compiled, &mut state);
@@ -75,7 +75,7 @@ fn backedge_halt_guard_after_instruction_done_preserves_loop_retirement() {
     builder.switch_to(loop_block);
     let current = builder.load_x_reg::<0>(IntWidth::W64);
     let one = builder.iconst(IConst::u64(1));
-    let next = builder.sub(current, one);
+    let next = builder.isub(current, one);
     builder.store_x_reg::<0>(next);
     builder.next_insn();
     builder.terminate(Terminator::BrZ(next, exit_block, loop_block));
@@ -83,7 +83,7 @@ fn backedge_halt_guard_after_instruction_done_preserves_loop_retirement() {
     builder.switch_to(exit_block);
     store_x_const::<1>(&mut builder, 0x5151);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 5;
     state.pc = 0x1000;
 
@@ -112,7 +112,7 @@ fn halts_inifnite_loop() {
 
     let code = run_full(
         builder,
-        &mut ProcessorState::initial(),
+        &mut ExecState::initial(),
         &empty_io_mmu(),
         |_processor_state, _io_mmu, halt_reason| {
             halt_reason.halt(expected_code);

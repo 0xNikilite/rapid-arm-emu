@@ -1,5 +1,5 @@
 use crate::helper::{call_compiled, compile, run, store_x_const};
-use emu_abi::processor_state::ProcessorState;
+use emu_abi::exec_state::ExecState;
 use exec_ir::{ExecIrBuilder, IConst, IntWidth, Terminator};
 
 mod helper;
@@ -13,7 +13,7 @@ fn return_fail_returns_halt_reason_and_preserves_prior_stores() {
     let halt_reason = builder.iconst(IConst::u32(0x4d2));
     builder.terminate(Terminator::ReturnCode(halt_reason));
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     assert_eq!(run(builder, &mut state), 0x4d2);
     assert_eq!(state.x_registers[0], 0x1234);
 }
@@ -37,12 +37,12 @@ fn branch_to_return_fail_only_fails_on_taken_path() {
 
     let compiled = compile(builder);
 
-    let mut fail_state = ProcessorState::initial();
+    let mut fail_state = ExecState::initial();
     fail_state.x_registers[0] = 1;
     assert_eq!(call_compiled(&compiled, &mut fail_state), 0xbeef);
     assert_eq!(fail_state.x_registers[1], 0);
 
-    let mut ok_state = ProcessorState::initial();
+    let mut ok_state = ExecState::initial();
     ok_state.x_registers[0] = 0;
     assert_eq!(call_compiled(&compiled, &mut ok_state), 0);
     assert_eq!(ok_state.x_registers[1], 0x600d);

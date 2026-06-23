@@ -9,7 +9,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-bitflags = "2.11.1"
 pastey = { workspace = true }
 bytemuck = { workspace = true }
 arrayvec = { workspace = true }

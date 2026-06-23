@@ -1,16 +1,17 @@
-use crate::armv9::{Armv9CpuCore, ProcessorState};
+use crate::armv9::{Armv9CpuCore, ExecState};
 use emu_abi::halt_reason::HaltReason;
-use emu_abi::memory::HostPointer;
+use emu_abi::memory::{HostPointer, PagePointer};
 use std::collections::HashMap;
-use std::ops::Range;
-// this might seem wierd, but when compiling a basic block,
-// we might start from one place, and go back
+
+// this might seem weird, but when compiling a basic block,
+// we might start from one place and go back
 // like:
 //               top:
 //               nop
 //               nop
 // jumps here -> add x, y;
 //               jump top
+// do note code blocks must not cross pages
 
 // TODO:
 //   - Make compiled code shared across CPU cores.
@@ -19,16 +20,7 @@ use std::ops::Range;
 //   - Move cross-core code-cache bookkeeping into CpuFabric.
 
 pub(crate) struct CodeBlock {
-    /// Half-open real address range touched while decoding.
-    ///
-    /// Range semantics:
-    ///     [start, end)
-    ///
-    /// This is used for cache invalidation, not for dispatch lookup.
-    ///
-    /// `start` is not guaranteed to be the entrypoint of the chunk.
-    _addr: Range<HostPointer>,
-
+    _page: PagePointer,
     _machine_code_handle: exec_ir::compiler::CompiledExecChunk,
 }
 
@@ -45,7 +37,7 @@ impl CodeCache {
         }
     }
 
-    pub fn run(&mut self, _state: &mut ProcessorState, _cpu: &Armv9CpuCore) -> Option<HaltReason> {
+    pub fn run(&mut self, _state: &mut ExecState, _cpu: &Armv9CpuCore) -> Option<HaltReason> {
         todo!()
     }
 

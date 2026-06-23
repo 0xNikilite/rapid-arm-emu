@@ -21,11 +21,12 @@ stacker = "0.1.24"
 [dependencies.gccjit]
 version = "3.3.0"
 
-[dependencies.inkwell]
-version = "0.9.0"
-features = ["llvm22-1-force-static"]
+[dependencies.llvm-sys-221]
+version = "221.0.0"
+package = "llvm-sys"
+features = ["force-static"]
 
 [dependencies.cranelift]
-version = "0.132.0"
+version = "0.133.0"
 features = ["jit", "frontend", "native", "module"]
 

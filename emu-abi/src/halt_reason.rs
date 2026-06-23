@@ -1,4 +1,3 @@
-use crate::internal_traits::AsFFI;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::num::NonZero;
@@ -199,13 +198,8 @@ impl AtomicHaltReason {
     }
 }
 
-impl AsFFI for AtomicHaltReason {
-    type Interface<'a> = &'a AtomicU32;
-
-    fn as_ffi<'a>(&'a self) -> Self::Interface<'a>
-    where
-        Self: 'a,
-    {
+impl AtomicHaltReason {
+    pub const fn as_ffi(&self) -> &AtomicU32 {
         &self.0
     }
 }

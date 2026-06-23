@@ -1,7 +1,7 @@
 use crate::helper::{
     call_compiled, compile, run_success, store_bool_as_x_reg, store_int_equals_as_x_reg, u64_const,
 };
-use emu_abi::processor_state::ProcessorState;
+use emu_abi::exec_state::ExecState;
 use exec_ir::{ExecIrBuilder, IConst, IntCmp, IntWidth};
 
 mod helper;
@@ -35,23 +35,23 @@ fn wrapping_add_sub_mul_and_neg_work() {
 
     let max = u64_const(&mut builder, u64::MAX);
     let one = u64_const(&mut builder, 1);
-    let add_wrapped = builder.add(max, one);
+    let add_wrapped = builder.iadd(max, one);
     builder.store_x_reg::<0>(add_wrapped);
 
     let zero = u64_const(&mut builder, 0);
-    let sub_wrapped = builder.sub(zero, one);
+    let sub_wrapped = builder.isub(zero, one);
     builder.store_x_reg::<1>(sub_wrapped);
 
     let high_bit = u64_const(&mut builder, 0x8000_0000_0000_0000);
     let two = u64_const(&mut builder, 2);
-    let mul_wrapped = builder.mul(high_bit, two);
+    let mul_wrapped = builder.imul(high_bit, two);
     builder.store_x_reg::<2>(mul_wrapped);
 
     let five = u64_const(&mut builder, 5);
-    let neg_five = builder.neg(five);
+    let neg_five = builder.ineg(five);
     builder.store_x_reg::<3>(neg_five);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     run_success(builder, &mut state);
 
     assert_eq!(state.x_registers[0], 0);
@@ -66,15 +66,15 @@ fn arithmetic_can_use_loaded_registers() {
 
     let x0 = builder.load_x_reg::<0>(IntWidth::W64);
     let x1 = builder.load_x_reg::<1>(IntWidth::W64);
-    let sum = builder.add(x0, x1);
+    let sum = builder.iadd(x0, x1);
     builder.store_x_reg::<2>(sum);
 
     let x2 = builder.load_x_reg::<2>(IntWidth::W64);
     let three = u64_const(&mut builder, 3);
-    let product = builder.mul(x2, three);
+    let product = builder.imul(x2, three);
     builder.store_x_reg::<3>(product);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 9;
     state.x_registers[1] = 11;
 
@@ -98,7 +98,7 @@ fn unsigned_division_handles_normal_and_zero_divisors() {
     let div_by_zero = builder.udiv(numerator, zero);
     builder.store_x_reg::<1>(div_by_zero);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     run_success(builder, &mut state);
 
     assert_eq!(state.x_registers[0], 14);
@@ -124,7 +124,7 @@ fn signed_division_handles_normal_zero_and_overflow_cases() {
     let overflow = builder.sdiv(int_min, minus_one);
     builder.store_x_reg::<2>(overflow);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     run_success(builder, &mut state);
 
     assert_eq!(state.x_registers[0], (-3_i64).cast_unsigned());
@@ -138,17 +138,17 @@ fn narrow_integer_ops_wrap_compare_and_divide_correctly() {
 
     let lhs = builder.iconst(IConst::u8(250));
     let rhs = builder.iconst(IConst::u8(10));
-    let value = builder.add(lhs, rhs);
+    let value = builder.iadd(lhs, rhs);
     store_int_equals_as_x_reg::<0>(&mut builder, value, IConst::u8(4));
 
     let lhs = builder.iconst(IConst::u16(0));
     let rhs = builder.iconst(IConst::u16(1));
-    let value = builder.sub(lhs, rhs);
+    let value = builder.isub(lhs, rhs);
     store_int_equals_as_x_reg::<1>(&mut builder, value, IConst::u16(u16::MAX));
 
     let lhs = builder.iconst(IConst::u32(0x8000_0000));
     let rhs = builder.iconst(IConst::u32(2));
-    let value = builder.mul(lhs, rhs);
+    let value = builder.imul(lhs, rhs);
     store_int_equals_as_x_reg::<2>(&mut builder, value, IConst::u32(0));
 
     let lhs = builder.iconst(IConst::u8(250));
@@ -172,14 +172,14 @@ fn narrow_integer_ops_wrap_compare_and_divide_correctly() {
     store_int_equals_as_x_reg::<6>(&mut builder, value, IConst::i16(i16::MIN));
 
     let value = builder.iconst(IConst::u8(1));
-    let value = builder.neg(value);
+    let value = builder.ineg(value);
     store_int_equals_as_x_reg::<7>(&mut builder, value, IConst::u8(255));
 
     let value = builder.iconst(IConst::u16(0x00ff));
     let value = builder.bitxor_imm(value, IConst::u16(0x0ff0));
     store_int_equals_as_x_reg::<8>(&mut builder, value, IConst::u16(0x0f0f));
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     run_success(builder, &mut state);
 
     for idx in 0..=8 {
@@ -211,7 +211,7 @@ fn signed_and_unsigned_division_cover_more_rounding_edges() {
     let value = builder.udiv(lhs, rhs);
     builder.store_x_reg::<3>(value);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     run_success(builder, &mut state);
 
     assert_eq!(state.x_registers[0], (-3_i64).cast_unsigned());
@@ -266,7 +266,7 @@ fn integer_comparisons_cover_signed_unsigned_and_immediates() {
     let cond = builder.icmp_imm(IntCmp::Equal, minus_one, IConst::i64(-1));
     store_bool_as_x_reg::<12>(&mut builder, cond);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     run_success(builder, &mut state);
 
     assert_eq!(state.x_registers[0], 0);
@@ -323,7 +323,7 @@ fn bitwise_integer_and_bool_ops_cover_reg_and_immediate_forms() {
     let value = builder.bitxor(true_bool, false_bool);
     store_bool_as_x_reg::<8>(&mut builder, value);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     run_success(builder, &mut state);
 
     assert_eq!(state.x_registers[0], 0x88);
@@ -358,13 +358,13 @@ fn select_handles_both_paths_and_bool_values() {
 
     let compiled = compile(builder);
 
-    let mut zero_state = ProcessorState::initial();
+    let mut zero_state = ExecState::initial();
     zero_state.x_registers[0] = 0;
     assert_eq!(call_compiled(&compiled, &mut zero_state), 0);
     assert_eq!(zero_state.x_registers[1], 0xbbbb);
     assert_eq!(zero_state.x_registers[2], 0);
 
-    let mut non_zero_state = ProcessorState::initial();
+    let mut non_zero_state = ExecState::initial();
     non_zero_state.x_registers[0] = 1;
     assert_eq!(call_compiled(&compiled, &mut non_zero_state), 0);
     assert_eq!(non_zero_state.x_registers[1], 0xaaaa);

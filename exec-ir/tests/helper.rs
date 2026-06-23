@@ -3,13 +3,14 @@
     reason = "not all of this module is always used by the test modules"
 )]
 
+use emu_abi::exec_state::ExecState;
 use emu_abi::halt_reason::AtomicHaltReason;
-use emu_abi::internal_traits::{ICache, InitInPlace};
+use emu_abi::internal_traits::InitInPlace;
 use emu_abi::memory::{PagePointer, Tlb};
-use emu_abi::processor_state::ProcessorState;
 use exec_ir::compiler::{CompileTier, CompiledExecChunk, ExecIrCompiler};
-use exec_ir::{ExecIrBuilder, IConst, IntCmp, SSAValue, Terminator};
+use exec_ir::{ExecIrBuilder, ExecStateExtra, IConst, IntCmp, SSAValue, Terminator};
 use io_mmu::cpu_fabric::CpuFabric;
+use io_mmu::icache::ICache;
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::sync::LazyLock;
@@ -45,23 +46,23 @@ pub fn compile(builder: ExecIrBuilder) -> CompiledExecChunk {
 
 pub fn call_compiled_full<T: ICache>(
     compiled: &CompiledExecChunk,
-    processor_state: &mut ProcessorState,
+    exec_state: &mut ExecState,
     io_mmu: &IoMMU<T>,
-    setup: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
-    post_process: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
+    setup: impl FnOnce(&mut ExecState, &IoMMU<T>, &AtomicHaltReason),
+    post_process: impl FnOnce(&mut ExecState, &IoMMU<T>, &AtomicHaltReason),
 ) -> u32 {
     let halt_reason = AtomicHaltReason::new();
-    setup(processor_state, io_mmu, &halt_reason);
+    setup(exec_state, io_mmu, &halt_reason);
 
     TLB.with_borrow_mut(|tlb| {
-        // FIXME VERY TEMPORARAY
-        let trap = compiled.call::<T>(processor_state, tlb, &halt_reason, io_mmu);
-        post_process(processor_state, io_mmu, &halt_reason);
+        let mut extra = ExecStateExtra::initial();
+        let trap = compiled.call::<T>(exec_state, &mut extra, tlb, &halt_reason, io_mmu);
+        post_process(exec_state, io_mmu, &halt_reason);
         trap
     })
 }
 
-pub fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut ProcessorState) -> u32 {
+pub fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut ExecState) -> u32 {
     call_compiled_full(
         compiled,
         processor_state,
@@ -73,10 +74,10 @@ pub fn call_compiled(compiled: &CompiledExecChunk, processor_state: &mut Process
 
 pub fn run_full<T: ICache>(
     builder: ExecIrBuilder,
-    processor_state: &mut ProcessorState,
+    processor_state: &mut ExecState,
     io_mmu: &IoMMU<T>,
-    setup: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
-    post_process: impl FnOnce(&mut ProcessorState, &IoMMU<T>, &AtomicHaltReason),
+    setup: impl FnOnce(&mut ExecState, &IoMMU<T>, &AtomicHaltReason),
+    post_process: impl FnOnce(&mut ExecState, &IoMMU<T>, &AtomicHaltReason),
 ) -> u32 {
     let compiled = compile(builder);
     call_compiled_full(&compiled, processor_state, io_mmu, setup, post_process)
@@ -84,18 +85,18 @@ pub fn run_full<T: ICache>(
 
 pub fn run_with_mmu<T: ICache>(
     builder: ExecIrBuilder,
-    processor_state: &mut ProcessorState,
+    processor_state: &mut ExecState,
     io_mmu: &IoMMU<T>,
 ) -> u32 {
     run_full(builder, processor_state, io_mmu, |_, _, _| {}, |_, _, _| {})
 }
 
-pub fn run(builder: ExecIrBuilder, processor_state: &mut ProcessorState) -> u32 {
+pub fn run(builder: ExecIrBuilder, processor_state: &mut ExecState) -> u32 {
     let compiled = compile(builder);
     call_compiled(&compiled, processor_state)
 }
 
-pub fn run_success(builder: ExecIrBuilder, processor_state: &mut ProcessorState) {
+pub fn run_success(builder: ExecIrBuilder, processor_state: &mut ExecState) {
     assert_eq!(run(builder, processor_state), 0);
 }
 

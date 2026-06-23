@@ -9,12 +9,17 @@ license.workspace = true
 publish = false
 
 [dependencies]
+once_cell = "1.21.4"
+thin-vec = "0.2.18"
 emu-abi = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-utils = { workspace = true }
 thiserror = { workspace = true }
 pastey = { workspace = true }
 bytemuck = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 loom = "0.7.2"
+tempfile = "3.27.0"
+

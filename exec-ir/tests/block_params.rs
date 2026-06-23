@@ -1,5 +1,5 @@
 use crate::helper::{call_compiled, compile, run_success, u64_const};
-use emu_abi::processor_state::ProcessorState;
+use emu_abi::exec_state::ExecState;
 use exec_ir::{ExecIrBuilder, IntWidth, Terminator, Type};
 
 mod helper;
@@ -13,16 +13,16 @@ fn block_parameter_passed_by_unconditional_branch_is_visible_in_target() {
 
     let x0 = builder.load_x_reg::<0>(IntWidth::W64);
     let delta = u64_const(&mut builder, 0x20);
-    let arg = builder.add(x0, delta);
+    let arg = builder.iadd(x0, delta);
 
     builder.terminate(Terminator::Br((target, vec![arg])));
 
     builder.switch_to(target);
     let one = u64_const(&mut builder, 1);
-    let result = builder.add(param, one);
+    let result = builder.iadd(param, one);
     builder.store_x_reg::<1>(result);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 0x1000;
 
     run_success(builder, &mut state);
@@ -49,17 +49,17 @@ fn block_parameter_arguments_act_like_phi_for_conditional_branch() {
 
     builder.switch_to(join);
     let one = u64_const(&mut builder, 1);
-    let result = builder.add(value, one);
+    let result = builder.iadd(value, one);
     builder.store_x_reg::<1>(result);
 
     let compiled = compile(builder);
 
-    let mut zero_state = ProcessorState::initial();
+    let mut zero_state = ExecState::initial();
     zero_state.x_registers[0] = 0;
     assert_eq!(call_compiled(&compiled, &mut zero_state), 0);
     assert_eq!(zero_state.x_registers[1], 3);
 
-    let mut non_zero_state = ProcessorState::initial();
+    let mut non_zero_state = ExecState::initial();
     non_zero_state.x_registers[0] = 1;
     assert_eq!(call_compiled(&compiled, &mut non_zero_state), 0);
     assert_eq!(non_zero_state.x_registers[1], 41);
@@ -82,12 +82,12 @@ fn brz_same_target_same_arguments_keeps_block_arguments() {
 
     let compiled = compile(builder);
 
-    let mut zero_state = ProcessorState::initial();
+    let mut zero_state = ExecState::initial();
     zero_state.x_registers[0] = 0;
     assert_eq!(call_compiled(&compiled, &mut zero_state), 0);
     assert_eq!(zero_state.x_registers[1], 0xfeed_face);
 
-    let mut non_zero_state = ProcessorState::initial();
+    let mut non_zero_state = ExecState::initial();
     non_zero_state.x_registers[0] = 123;
     assert_eq!(call_compiled(&compiled, &mut non_zero_state), 0);
     assert_eq!(non_zero_state.x_registers[1], 0xfeed_face);
@@ -116,8 +116,8 @@ fn loop_carried_block_parameters_update_on_backedge() {
     builder.add_safepoint();
 
     let one = u64_const(&mut builder, 1);
-    let next_remaining = builder.sub(remaining, one);
-    let next_acc = builder.add(acc, remaining);
+    let next_remaining = builder.isub(remaining, one);
+    let next_acc = builder.iadd(acc, remaining);
 
     builder.terminate(Terminator::BrZ(
         next_remaining,
@@ -128,7 +128,7 @@ fn loop_carried_block_parameters_update_on_backedge() {
     builder.switch_to(exit_block);
     builder.store_x_reg::<1>(result);
 
-    let mut state = ProcessorState::initial();
+    let mut state = ExecState::initial();
     state.x_registers[0] = 4;
 
     run_success(builder, &mut state);

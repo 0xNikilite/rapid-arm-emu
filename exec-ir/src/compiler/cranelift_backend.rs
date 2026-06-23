@@ -1,21 +1,25 @@
 use crate::arena::ArenaMap;
 use crate::array_helper;
 use crate::compiler::{CompileBlockOptions, CompiledExecChunk, ExecBlockFFI};
+use crate::{AliasRegion as IrAliasRegion, Block as IrBlock, Jump as IrJump, Type as IrType};
 use crate::{
     Arg, ArithBinOp, BitwiseOp, CallbackSignature, ExecIr, HOST_CB_SMALL_ARGS, IConst, IntCmp,
     IntWidth, LoadType, MAX_STMT_OUTPUTS, OverflowingBinOp, SSAValue, ShiftOp, StackSlot, StmtData,
     StmtKind, Terminator, TerminatorKind,
 };
-use crate::{Block as IrBlock, Jump as IrJump, Type as IrType};
 use anyhow::{Context, anyhow, ensure};
 use arrayvec::ArrayVec;
 use cranelift::codegen::ir as clif_ir;
+use cranelift::codegen::ir::{AliasRegion, AliasRegionData};
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{Linkage, Module};
 use cranelift::prelude::isa::OwnedTargetIsa;
-use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlags};
+use cranelift::prelude::{AbiParam, Configurable, InstBuilder, IntCC, MemFlagsData};
+use emu_abi::memory::Page;
 use smallvec::SmallVec;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::mem::ManuallyDrop;
 use std::num::NonZero;
@@ -33,7 +37,7 @@ fn ir_ty_to_clif_ty(ptr_ty: clif_ir::Type, ty: IrType) -> clif_ir::Type {
     match ty {
         IrType::Bool => clif_ir::types::I8,
         IrType::Int(width) => clif_int_ty(width),
-        IrType::HostPtr => ptr_ty,
+        IrType::HostPtr(_) => ptr_ty,
     }
 }
 
@@ -43,7 +47,7 @@ struct FunctionLowering<'a> {
     exec_ir: &'a ExecIr,
     ptr_ty: clif_ir::Type,
 
-    live_ordered_blocks: &'a [IrBlock],
+    alias_regions: [Option<AliasRegion>; IrAliasRegion::COUNT],
     stack_slots: ArenaMap<StackSlot, clif_ir::StackSlot>,
     values: ArenaMap<SSAValue, clif_ir::Value>,
     blocks: ArenaMap<IrBlock, clif_ir::Block>,
@@ -122,7 +126,7 @@ impl<'a> FunctionLowering<'a> {
             exec_ir,
             ptr_ty,
 
-            live_ordered_blocks: &exec_ir.block_compile_order,
+            alias_regions: [None; IrAliasRegion::COUNT],
             values,
             blocks,
             stack_slots,
@@ -190,7 +194,7 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-    fn lower_stmt(&mut self, _exec_ir: &ExecIr, stmt: &StmtData) -> anyhow::Result<()> {
+    fn lower_stmt(&mut self, stmt: &StmtData) -> anyhow::Result<()> {
         let values = self.lower_rvalue(&stmt.rvalue)?;
         let outputs = stmt.outputs.as_slice();
 
@@ -206,23 +210,48 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-    fn host_memory_flags(can_move: bool) -> MemFlags {
-        let mut flags = MemFlags::trusted();
+    fn alias_region(&mut self, alias_region: IrAliasRegion) -> AliasRegion {
+        *self.alias_regions[alias_region as usize].get_or_insert_with(|| {
+            self.builder.func.dfg.alias_regions.insert(AliasRegionData {
+                user_id: u32::try_from(alias_region as usize).unwrap(),
+                description: Cow::Owned(format!("{alias_region:?}")),
+            })
+        })
+    }
+
+    // the exact alias regions don't really mean ANYTHING
+    // they are just 3 buckets. I decided that mutable VM stuff is `VmCtx`
+    // and `ExecState` stuff is `Table` and `VirtualMemory` is `Heap`
+    // but these names could be anything
+    fn host_memory_flags(&mut self, can_move: bool, alias_region: IrAliasRegion) -> MemFlagsData {
+        assert_ne!(alias_region, IrAliasRegion::VirtualMemory);
+
+        let alias = self.alias_region(alias_region);
+        let mut flags = MemFlagsData::trusted().with_alias_region(Some(alias));
         if can_move {
             flags.set_can_move();
+        }
+
+        if let IrAliasRegion::ReadOnly = alias_region {
+            flags.set_readonly();
         }
 
         flags
     }
 
-    fn guest_memory_flags() -> MemFlags {
-        MemFlags::trusted().with_endianness(clif_ir::Endianness::Little)
+    fn guest_memory_flags(&mut self, alias_region: IrAliasRegion) -> MemFlagsData {
+        assert_eq!(alias_region, IrAliasRegion::VirtualMemory);
+
+        MemFlagsData::trusted()
+            .with_endianness(clif_ir::Endianness::Little)
+            .with_alias_region(Some(self.alias_region(IrAliasRegion::VirtualMemory)))
     }
 
     fn lower_host_load(
         &mut self,
         ty: LoadType,
         base_ptr: SSAValue,
+        alias_region: IrAliasRegion,
         offset: usize,
         can_move: bool,
     ) -> anyhow::Result<clif_ir::Value> {
@@ -232,12 +261,13 @@ impl<'a> FunctionLowering<'a> {
 
         let ty = match ty {
             LoadType::Int(width) => clif_int_ty(width),
-            LoadType::HostPtr => self.ptr_ty,
+            LoadType::HostPtr(_) => self.ptr_ty,
         };
 
+        let flags = self.host_memory_flags(can_move, alias_region);
         Ok(self.builder.ins().load(
             ty,
-            Self::host_memory_flags(can_move),
+            flags,
             base_ptr,
             clif_ir::immediates::Offset32::new(offset),
         ))
@@ -246,6 +276,7 @@ impl<'a> FunctionLowering<'a> {
     fn lower_host_store(
         &mut self,
         base_ptr: SSAValue,
+        alias_region: IrAliasRegion,
         offset: usize,
         value: clif_ir::Value,
         can_move: bool,
@@ -255,8 +286,9 @@ impl<'a> FunctionLowering<'a> {
         let offset =
             i32::try_from(offset).context("internal compiler error host load offset too large")?;
 
+        let flags = self.host_memory_flags(can_move, alias_region);
         self.builder.ins().store(
-            Self::host_memory_flags(can_move),
+            flags,
             value,
             base_ptr,
             clif_ir::immediates::Offset32::new(offset),
@@ -343,8 +375,10 @@ impl<'a> FunctionLowering<'a> {
         &mut self,
         rvalue: &StmtKind,
     ) -> anyhow::Result<ArrayVec<clif_ir::Value, MAX_STMT_OUTPUTS>> {
+        use array_helper::{empty, from_arr};
+
         let value = match *rvalue {
-            StmtKind::IConst(iconst) => array_helper::from_arr([self.iconst(iconst)]),
+            StmtKind::IConst(iconst) => from_arr([self.iconst(iconst)]),
 
             StmtKind::ArithBinOp { op, lhs, rhs } => {
                 let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
@@ -357,26 +391,32 @@ impl<'a> FunctionLowering<'a> {
                     ArithBinOp::UncheckedSDiv => ins.sdiv(lhs, rhs),
                 };
 
-                array_helper::from_arr([value])
+                from_arr([value])
             }
 
             StmtKind::AddImm { value, imm64 } => {
                 let value = self.use_value(value)?;
                 let new_value = self.builder.ins().iadd_imm(value, imm64.cast_signed());
-                array_helper::from_arr([new_value])
+                from_arr([new_value])
+            }
+
+            StmtKind::IntNeg(val) => {
+                let val = self.use_value(val)?;
+                let res = self.builder.ins().ineg(val);
+                from_arr([res])
             }
 
             StmtKind::IntCmp { cmp, lhs, rhs } => {
                 let op = Self::convert_to_intcc(cmp);
                 let (lhs, rhs) = (self.use_value(lhs)?, self.use_value(rhs)?);
-                array_helper::from_arr([self.builder.ins().icmp(op, lhs, rhs)])
+                from_arr([self.builder.ins().icmp(op, lhs, rhs)])
             }
 
             StmtKind::IntCmpImm { cmp, lhs, rhs } => {
                 let op = Self::convert_to_intcc(cmp);
                 let lhs = self.use_value(lhs)?;
                 let rhs = rhs.cast_signed();
-                array_helper::from_arr([self.builder.ins().icmp_imm(op, lhs, rhs)])
+                from_arr([self.builder.ins().icmp_imm(op, lhs, rhs)])
             }
 
             StmtKind::Select {
@@ -390,7 +430,7 @@ impl<'a> FunctionLowering<'a> {
                     self.use_value(if_false)?,
                 );
 
-                array_helper::from_arr([self.builder.ins().select(cond, if_true, if_false)])
+                from_arr([self.builder.ins().select(cond, if_true, if_false)])
             }
 
             StmtKind::Bitwise { op, lhs, rhs } => {
@@ -403,7 +443,7 @@ impl<'a> FunctionLowering<'a> {
                     BitwiseOp::Xor => ins.bxor(lhs, rhs),
                 };
 
-                array_helper::from_arr([value])
+                from_arr([value])
             }
 
             StmtKind::BitwiseImm { op, lhs, rhs } => {
@@ -416,23 +456,57 @@ impl<'a> FunctionLowering<'a> {
                     BitwiseOp::Xor => ins.bxor_imm(lhs, rhs),
                 };
 
-                array_helper::from_arr([value])
+                from_arr([value])
             }
 
-            StmtKind::ShiftImm {
-                op,
-                value,
-                shift_ammount,
-            } => {
+            StmtKind::BitNot(val) => {
+                let val = self.use_value(val)?;
+                let res = self.builder.ins().bnot(val);
+                from_arr([res])
+            }
+
+            StmtKind::Shift { op, value, shift } => {
+                let value = self.use_value(value)?;
+                let shift = self.use_value(shift)?;
+                let ty = self.builder.func.dfg.value_type(value);
+
+                let bits = ty.bits();
+
+                // if shift >= bits, clamp result
+                let in_range =
+                    self.builder
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedLessThan, shift, i64::from(bits));
+
+                let shifted = match op {
+                    ShiftOp::SignExtendShr => self.builder.ins().sshr(value, shift),
+                    ShiftOp::ZeroExtendShr => self.builder.ins().ushr(value, shift),
+                    ShiftOp::Shl => self.builder.ins().ishl(value, shift),
+                };
+
+                let overflow_val = match op {
+                    ShiftOp::SignExtendShr => self
+                        .builder
+                        .ins()
+                        .sshr_imm(value, i64::from(bits.strict_sub(1))),
+                    ShiftOp::ZeroExtendShr | ShiftOp::Shl => self.builder.ins().iconst(ty, 0),
+                };
+
+                let output = self.builder.ins().select(in_range, shifted, overflow_val);
+                from_arr([output])
+            }
+
+            StmtKind::ShiftImm { op, value, shift } => {
                 let value = self.use_value(value)?;
                 let ins = self.builder.ins();
-                let shift_ammount = i64::from(shift_ammount);
+                let shift_amount = i64::from(shift);
                 let output = match op {
-                    // ShiftOp::SignExtendShr => ins.sshr_imm(value, shift_ammount),
-                    ShiftOp::ZeroExtendShr => ins.ushr_imm(value, shift_ammount),
-                    // ShiftOp::Shl => ins.ishl_imm(value, shift_ammount),
+                    ShiftOp::SignExtendShr => ins.sshr_imm(value, shift_amount),
+                    ShiftOp::ZeroExtendShr => ins.ushr_imm(value, shift_amount),
+                    ShiftOp::Shl => ins.ishl_imm(value, shift_amount),
                 };
-                array_helper::from_arr([output])
+
+                from_arr([output])
             }
 
             StmtKind::OverflowingBinOp { op, lhs, rhs } => {
@@ -443,7 +517,7 @@ impl<'a> FunctionLowering<'a> {
                     OverflowingBinOp::Sub => ins.ssub_overflow(lhs, rhs),
                 };
 
-                array_helper::from_arr([value, overflow])
+                from_arr([value, overflow])
             }
 
             StmtKind::LoadHost {
@@ -452,8 +526,11 @@ impl<'a> FunctionLowering<'a> {
                 offset,
                 can_move,
             } => {
-                let loaded_val = self.lower_host_load(ty, base_ptr, offset, can_move)?;
-                array_helper::from_arr([loaded_val])
+                let IrType::HostPtr(alias) = self.exec_ir.ssa_values[base_ptr].ty else {
+                    panic!("can't load non pointer type")
+                };
+                let loaded_val = self.lower_host_load(ty, base_ptr, alias, offset, can_move)?;
+                from_arr([loaded_val])
             }
 
             StmtKind::StoreHost {
@@ -462,15 +539,18 @@ impl<'a> FunctionLowering<'a> {
                 value,
                 can_move,
             } => {
+                let IrType::HostPtr(alias) = self.exec_ir.ssa_values[base_ptr].ty else {
+                    panic!("can't store non pointer type")
+                };
                 let value = self.use_value(value)?;
-                self.lower_host_store(base_ptr, offset, value, can_move)?;
-                array_helper::from_arr([])
+                self.lower_host_store(base_ptr, alias, offset, value, can_move)?;
+                empty()
             }
 
             StmtKind::LoadStackPtr { slot } => {
                 let slot = self.use_stack_slot(slot)?;
                 let addr = self.builder.ins().stack_addr(self.ptr_ty, slot, 0);
-                array_helper::from_arr([addr])
+                from_arr([addr])
             }
 
             StmtKind::PtrAdd {
@@ -479,7 +559,7 @@ impl<'a> FunctionLowering<'a> {
                 elem_size,
             } => {
                 let out_ptr = self.ptr_add(base_ptr, offset, elem_size)?;
-                array_helper::from_arr([out_ptr])
+                from_arr([out_ptr])
             }
 
             StmtKind::PtrEq(ptr_a, ptr_b) => {
@@ -488,20 +568,20 @@ impl<'a> FunctionLowering<'a> {
                 self.assert_value_ty(ptr_a, self.ptr_ty, "PtrEq ptr_a")?;
                 self.assert_value_ty(ptr_b, self.ptr_ty, "PtrEq ptr_b")?;
                 let output = self.builder.ins().icmp(IntCC::Equal, ptr_a, ptr_b);
-                array_helper::from_arr([output])
+                from_arr([output])
             }
 
             StmtKind::HasTag { ptr, tag_bits } => {
                 let ptr = self.use_value(ptr)?;
                 let output = self.builder.ins().band_imm(ptr, i64::from(tag_bits));
-                array_helper::from_arr([output])
+                from_arr([output])
             }
 
             StmtKind::Untag { ptr, tag_bits } => {
                 let ptr = self.use_value(ptr)?;
                 let mask = !i64::from(tag_bits);
                 let output = self.builder.ins().band_imm(ptr, mask);
-                array_helper::from_arr([output])
+                from_arr([output])
             }
 
             StmtKind::HostCallback {
@@ -534,10 +614,11 @@ impl<'a> FunctionLowering<'a> {
             } => {
                 let int_ty = clif_int_ty(width);
                 let ptr = self.ptr_byte_add(aligned_page_ptr, page_offset)?;
-                let flags = Self::guest_memory_flags();
+                let flags = self.guest_memory_flags(IrAliasRegion::VirtualMemory);
                 let loaded_val = self.builder.ins().atomic_load(int_ty, flags, ptr);
-                array_helper::from_arr([loaded_val])
+                from_arr([loaded_val])
             }
+
             StmtKind::VMStoreRaw {
                 aligned_page_ptr,
                 page_offset,
@@ -545,25 +626,25 @@ impl<'a> FunctionLowering<'a> {
             } => {
                 let value = self.use_value(value)?;
                 let ptr = self.ptr_byte_add(aligned_page_ptr, page_offset)?;
-                let flags = Self::guest_memory_flags();
+                let flags = self.guest_memory_flags(IrAliasRegion::VirtualMemory);
                 self.builder.ins().atomic_store(flags, value, ptr);
-                array_helper::from_arr([])
+                from_arr([])
             }
 
             StmtKind::LoadHaltReason => {
-                // although accessing the halt reason is **always** safe to do
+                // although accessing the halt reason is **always** safe to do,
                 // having the load halt reason operation move is quite unexpected
-                // and can lead to just well never halting
+                // and can lead to well, never quite halting
                 // because the halt check moved to the end of the start of the function
-                // and was just reasding stale halt reasons
+                // and was just reading stale `HaltReason`
                 let can_move = false;
                 let ptr = self.use_value(SSAValue::ARG_HALT_REASON_PTR)?;
-                let value = self.builder.ins().atomic_load(
-                    clif_ir::types::I32,
-                    Self::host_memory_flags(can_move),
-                    ptr,
-                );
-                array_helper::from_arr([value])
+                let flags = self.host_memory_flags(can_move, IrAliasRegion::HaltReason);
+                let value = self
+                    .builder
+                    .ins()
+                    .atomic_load(clif_ir::types::I32, flags, ptr);
+                from_arr([value])
             }
 
             StmtKind::TakeHaltReason => {
@@ -571,41 +652,57 @@ impl<'a> FunctionLowering<'a> {
                 let can_move = false;
                 let zero = self.iconst(IConst::zero(IntWidth::W32));
                 let ptr = self.use_value(SSAValue::ARG_HALT_REASON_PTR)?;
+                let flags = self.host_memory_flags(can_move, IrAliasRegion::HaltReason);
                 let value = self.builder.ins().atomic_rmw(
                     clif_ir::types::I32,
-                    Self::host_memory_flags(can_move),
+                    flags,
                     clif_ir::AtomicRmwOp::Xchg,
                     ptr,
                     zero,
                 );
 
-                array_helper::from_arr([value])
+                from_arr([value])
             }
 
+            // all loads and stores are already `SeqCst`,
+            // so there is no need for a memory fence
             StmtKind::GetInstructionDirtyFlag(insn_dirty) => {
-                // same reasons as `StmtKind::LoadHaltReason` stated above
+                // this can't move and MUST happen **after** writing the value into the page
+                // doing it before that may lead to never actually marking the page dirty
                 let can_move = false;
                 let ptr = self.use_value(insn_dirty)?;
-                let value = self.builder.ins().atomic_load(
-                    clif_ir::types::I8,
-                    Self::host_memory_flags(can_move),
-                    ptr,
-                );
-                array_helper::from_arr([value])
+                let flags = self.host_memory_flags(can_move, IrAliasRegion::PageFlags);
+                let value = self
+                    .builder
+                    .ins()
+                    .atomic_load(clif_ir::types::I8, flags, ptr);
+
+                let bit = self
+                    .builder
+                    .ins()
+                    .band_imm(value, i64::from(Page::DIRTY_FLAG_IS_DIRTY));
+
+                from_arr([bit])
             }
 
             StmtKind::SetInstructionDirtyFlag(insn_dirty) => {
-                // same reasons as `StmtKind::LoadHaltReason` stated above
+                // same reasons as `GetInstructionDirtyFlag` stated above
                 let can_move = false;
                 let ptr = self.use_value(insn_dirty)?;
-                let true_val = self.iconst(IConst::u8(1));
-                self.builder
-                    .ins()
-                    .atomic_store(Self::host_memory_flags(can_move), true_val, ptr);
-                array_helper::empty()
+                let flag_val = self.iconst(IConst::u8(Page::DIRTY_FLAG_IS_DIRTY));
+
+                let flags = self.host_memory_flags(can_move, IrAliasRegion::PageFlags);
+                self.builder.ins().atomic_rmw(
+                    clif_ir::types::I8,
+                    flags,
+                    clif_ir::AtomicRmwOp::Or,
+                    ptr,
+                    flag_val,
+                );
+                empty()
             }
 
-            StmtKind::Safepoint => array_helper::from_arr([]),
+            StmtKind::Safepoint => from_arr([]),
         };
 
         Ok(value)
@@ -648,17 +745,16 @@ impl<'a> FunctionLowering<'a> {
         Ok(())
     }
 
-    fn lower_blocks(&mut self, exec_ir: &ExecIr) -> anyhow::Result<()> {
-        for &ir_block in self.live_ordered_blocks {
+    fn lower_blocks(&mut self) -> anyhow::Result<()> {
+        for &ir_block in &self.exec_ir.block_compile_order {
             let clif_block = self.clif_block(ir_block)?;
 
             self.builder.switch_to_block(clif_block);
 
-            let block_data = &exec_ir.blocks[ir_block];
+            let block_data = &self.exec_ir.blocks[ir_block];
 
             for &stmt in &block_data.stmts {
-                let stmt = &exec_ir.stmts[stmt];
-                self.lower_stmt(exec_ir, stmt)?;
+                self.lower_stmt(&self.exec_ir.stmts[stmt])?;
             }
 
             self.lower_terminator(&block_data.terminator)?;
@@ -682,7 +778,7 @@ impl<'a> FunctionLowering<'a> {
 fn exec_block_signature(module: &JITModule) -> clif_ir::Signature {
     let ptr_ty = module.target_config().pointer_type();
 
-    // this makes a signature with the target tripples default calling convention
+    // this makes a signature with the target triples default calling convention,
     // which is basically the C calling convention
     let mut sig = module.make_signature();
 
@@ -729,12 +825,12 @@ impl CraneliftCompiler {
         flag_builder.set("is_pic", "false")?;
 
         // JIT frames are not intended to be stack-walked by profilers/debuggers.
-        // Omitting frame pointers can reduce prologue/epilogue work and keeps an
+        // Omitting frame pointers can reduce prologue/epilogue work and keep an
         // extra register available on targets where the frame pointer would otherwise
         // be reserved.
         flag_builder.set("preserve_frame_pointers", "false")?;
 
-        // Generated JIT functions must not unwind across this boundary. We do not need
+        // Generated JIT functions must not unwind across this boundary. We do not need any
         // DWARF/Windows unwind metadata for exceptions, panics, GC stack walking, or
         // debugger frame reconstruction, so skip emitting it to reduce compile-time
         // metadata work.
@@ -755,8 +851,8 @@ impl CraneliftCompiler {
         // logs are not wanted
         flag_builder.set("regalloc_verbose_logs", "false")?;
 
-        // lower compile time by removing verfification
-        // since the IR is already pre checked and verified/trusted
+        // lower compile time by removing verification
+        // since the IR is already pre-checked and verified/trusted
         let check_flag = bool_to_str(cfg!(debug_assertions));
         flag_builder.set("enable_verifier", check_flag)?;
         flag_builder.set("regalloc_checker", check_flag)?;
@@ -801,87 +897,103 @@ impl CraneliftCompiler {
         exec_ir: &ExecIr,
         optimized: bool,
     ) -> anyhow::Result<CompiledExecChunk> {
-        let isa = match optimized {
-            true => &self.compile_optimized_isa,
-            false => &self.compile_fast_isa,
-        };
+        use cranelift::codegen::Context;
 
-        let builder = JITBuilder::with_isa(isa.clone(), cranelift::module::default_libcall_names());
+        thread_local! {
+            static SCRATCH: RefCell<Option<(Context, FunctionBuilderContext)>> = const {
+                RefCell::new(None)
+            };
+        }
 
-        let mut module = JITModule::new(builder);
-        let mut ctx = module.make_context();
-        let mut builder_ctx = FunctionBuilderContext::new();
+        SCRATCH.with_borrow_mut(|slot| {
+            let (mut ctx, mut builder_ctx) = slot
+                .take()
+                .unwrap_or_else(|| (Context::new(), FunctionBuilderContext::new()));
 
-        ctx.set_disasm(options.show_disasm);
+            let isa = match optimized {
+                true => &self.compile_optimized_isa,
+                false => &self.compile_fast_isa,
+            };
 
-        ctx.func.signature = exec_block_signature(&module);
+            ctx.func.signature.call_conv = isa.default_call_conv();
 
-        let mut clif_disasm_output = String::new();
+            let builder =
+                JITBuilder::with_isa(isa.clone(), cranelift::module::default_libcall_names());
+            let mut module = JITModule::new(builder);
 
-        {
-            let ptr_ty = module.target_config().pointer_type();
-            let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            ctx.set_disasm(options.show_disasm);
 
-            let mut lowering = FunctionLowering::new(builder, &module, exec_ir, ptr_ty)?;
+            ctx.func.signature = exec_block_signature(&module);
 
-            lowering.lower_blocks(exec_ir)?;
-            lowering.finish();
+            let mut clif_disasm_output = String::new();
+
+            {
+                let ptr_ty = module.target_config().pointer_type();
+                let builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+
+                let mut lowering = FunctionLowering::new(builder, &module, exec_ir, ptr_ty)?;
+
+                lowering.lower_blocks()?;
+                lowering.finish();
+
+                if options.show_disasm {
+                    // do it here because afterward the `clif` will get optimized
+                    clif_disasm_output = ctx.func.display().to_string()
+                }
+            }
+
+            let func_id = module
+                .declare_function(&options.function_name, Linkage::Export, &ctx.func.signature)
+                .map_err(|err| anyhow!("declare_function failed: {err}"))?;
+
+            module
+                .define_function(func_id, &mut ctx)
+                .map_err(|err| anyhow!("define_function failed: {err}"))?;
 
             if options.show_disasm {
-                // do it here because afterwards the clif will get optimized
-                clif_disasm_output = ctx.func.display().to_string()
+                let code = ctx
+                    .compiled_code()
+                    .expect("Cranelift did not leave compiled code in the context");
+
+                eprintln!(
+                    "{name}:\nclif:\n{clif_disasm_output}\nassembly:\n{disasm}",
+                    name = options.function_name,
+                    disasm = code
+                        .vcode
+                        .as_deref()
+                        .unwrap_or("no disassembly was produced")
+                );
             }
-        }
 
-        let func_id = module
-            .declare_function(&options.function_name, Linkage::Export, &ctx.func.signature)
-            .map_err(|err| anyhow!("declare_function failed: {err}"))?;
+            module.clear_context(&mut ctx);
 
-        module
-            .define_function(func_id, &mut ctx)
-            .map_err(|err| anyhow!("define_function failed: {err}"))?;
+            *slot = Some((ctx, builder_ctx));
 
-        if options.show_disasm {
-            let code = ctx
-                .compiled_code()
-                .expect("Cranelift did not leave compiled code in the context");
+            module
+                .finalize_definitions()
+                .map_err(|err| anyhow!("finalize_definitions failed: {err}"))?;
 
-            eprintln!(
-                "{name}:\nclif:\n{clif_disasm_output}\nassembly:\n{disasm}",
-                name = options.function_name,
-                disasm = code
-                    .vcode
-                    .as_deref()
-                    .unwrap_or("no disassembly was produced")
-            );
-        }
+            let code_ptr = module.get_finalized_function(func_id);
 
-        module.clear_context(&mut ctx);
+            let ffi: ExecBlockFFI = unsafe {
+                // Safety:
+                // - `exec_block_signature` must exactly match `ExecBlockFFI`.
+                // - `module` is moved into `resources`, keeping finalized code alive.
+                std::mem::transmute::<*const u8, ExecBlockFFI>(code_ptr)
+            };
 
-        module
-            .finalize_definitions()
-            .map_err(|err| anyhow!("finalize_definitions failed: {err}"))?;
+            struct DropModule(ManuallyDrop<JITModule>);
 
-        let code_ptr = module.get_finalized_function(func_id);
-
-        let ffi: ExecBlockFFI = unsafe {
-            // Safety:
-            // - `exec_block_signature` must exactly match `ExecBlockFFI`.
-            // - `module` is moved into `resources`, keeping finalized code alive.
-            std::mem::transmute::<*const u8, ExecBlockFFI>(code_ptr)
-        };
-
-        struct DropModule(ManuallyDrop<JITModule>);
-
-        impl Drop for DropModule {
-            fn drop(&mut self) {
-                unsafe { ManuallyDrop::take(&mut self.0).free_memory() };
+            impl Drop for DropModule {
+                fn drop(&mut self) {
+                    unsafe { ManuallyDrop::take(&mut self.0).free_memory() };
+                }
             }
-        }
 
-        Ok(CompiledExecChunk::new_with_recources(
-            ffi,
-            DropModule(ManuallyDrop::new(module)),
-        ))
+            Ok(CompiledExecChunk::new_with_recources(
+                ffi,
+                DropModule(ManuallyDrop::new(module)),
+            ))
+        })
     }
 }

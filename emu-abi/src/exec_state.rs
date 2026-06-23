@@ -1,5 +1,3 @@
-use std::mem::MaybeUninit;
-
 #[derive(bytemuck::Pod, bytemuck::Zeroable, Copy, Clone)]
 #[repr(C, align(16))]
 pub struct Vector(pub u128);
@@ -26,41 +24,30 @@ impl PState {
     pub const NZCV_MASK: Self = Self(Self::N.0 | Self::Z.0 | Self::C.0 | Self::V.0);
 }
 
-#[derive(bytemuck::Zeroable)]
-pub struct ProcessorState {
-    pub sp: u64,
+#[derive(bytemuck::Zeroable, Clone)]
+// use `repr(C)` so that we can put hot field s next to each other
+// so they land on the same cacheline and so that hot fields have
+// smaller constant indices to fit inline in an instruction encoding
+// rather than an integer immediate, but do note that repr(C) is NOT
+// required for safety, and all offset calculations must use `offset_of!`
+// this is only here as an optimization and not for correctness
+// that is why, we target `repr(Rust)` on debug and miri builds
+// to catch any bugs caused by not using `offset_of!`
+// we exclude doc so rustdoc doesn't advertise this as a public layout guarantee
+#[cfg_attr(not(any(doc, debug_assertions, miri)), repr(C))]
+pub struct ExecState {
     pub pc: u64,
     pub x_registers: [u64; X_REGISTER_COUNT as usize],
+    pub sp: u64,
     pub pstate: PState,
     pub fpsr: u32,
     pub fpcr: u32,
     pub vectors: [Vector; 32],
 }
 
-impl ProcessorState {
+impl ExecState {
     #[inline(always)]
     pub const fn initial() -> Self {
         bytemuck::zeroed()
-    }
-}
-
-#[derive(bytemuck::Zeroable)]
-#[repr(C)]
-pub struct ExecState {
-    pub state: ProcessorState,
-    pub trap_paylod: MaybeUninit<u64>,
-}
-
-impl ExecState {
-    pub const fn initial() -> Self {
-        const { Self::from_processor_state(ProcessorState::initial()) }
-    }
-
-    #[inline(always)]
-    pub const fn from_processor_state(state: ProcessorState) -> Self {
-        Self {
-            state,
-            trap_paylod: MaybeUninit::uninit(),
-        }
     }
 }

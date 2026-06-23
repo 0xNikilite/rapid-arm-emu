@@ -1,5 +1,5 @@
-use emu_abi::internal_traits::ICache;
 use emu_abi::memory::Tlb;
+use io_mmu::icache::ICache;
 use std::mem::MaybeUninit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

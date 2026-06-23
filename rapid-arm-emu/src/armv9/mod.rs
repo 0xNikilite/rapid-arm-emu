@@ -1,13 +1,13 @@
 use crate::address_space::IoMMU;
 use crate::armv9::jit::CodeCache;
+use emu_abi::exec_state::ExecState;
 use emu_abi::halt_reason::{AtomicHaltReason, HaltReason};
-use emu_abi::processor_state::ProcessorState;
 use parking_lot::Mutex;
 
 pub(crate) mod jit;
 
 struct ExecutingState {
-    processor_state: ProcessorState,
+    processor_state: ExecState,
     code_cache: CodeCache,
 }
 
@@ -29,7 +29,7 @@ impl Armv9CpuCore {
             mmu,
             halt_reason: AtomicHaltReason::new(),
             executing: Mutex::new(ExecutingState {
-                processor_state: ProcessorState::initial(),
+                processor_state: ExecState::initial(),
                 code_cache: CodeCache::new(),
             }),
         }
@@ -61,7 +61,7 @@ impl Armv9CpuCore {
             if let Some(reason) = halt_reason {
                 if reason == HaltReason::FLUSH_INSN_CACHE {
                     state.code_cache.invalidate();
-                    self.mmu.flush_dirty_pages();
+                    self.mmu.flush_async();
                     continue;
                 }
 
